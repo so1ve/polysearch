@@ -5,13 +5,6 @@
 //!
 //! # Usage
 //!
-//! Add `polysearch` to your `Cargo.toml`:
-//!
-//! ```toml
-//! [dependencies]
-//! polysearch = "0.1"
-//! ```
-//!
 //! Build a [`Searcher`] once and reuse it for queries:
 //!
 //! ```
