@@ -1,0 +1,47 @@
+[package]
+name = "polysearch"
+version = "0.1.0"
+edition = "2024"
+description = "An in-memory fuzzy search library for launchers and command palettes"
+license = "MIT"
+repository = "https://github.com/so1ve/polysearch"
+
+[features]
+pinyin = ["dep:pinyin_pro"]
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+clone_on_ref_ptr = "warn"
+default_trait_access = "warn"
+disallowed_methods = "warn"
+enum_glob_use = "warn"
+fn_params_excessive_bools = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+implicit_clone = "warn"
+items_after_statements = "warn"
+manual_let_else = "warn"
+manual_string_new = "warn"
+match_same_arms = "warn"
+match_wildcard_for_single_variants = "warn"
+missing_const_for_fn = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+new_without_default = "allow"
+redundant_pub_crate = "warn"
+semicolon_if_nothing_returned = "warn"
+single_match_else = "warn"
+struct_excessive_bools = "warn"
+undocumented_unsafe_blocks = "warn"
+uninlined_format_args = "warn"
+unnecessary_literal_bound = "warn"
+use_self = "warn"
+verbose_file_reads = "warn"
+wildcard_imports = "warn"
+
+[dependencies]
+arrayvec = "0.7.8"
+pinyin_pro = { version = "3.29.4", optional = true }
+rapidhash = "4.5.1"
+smallvec = "1.15.1"
+string-interner = { version = "0.20.0", default-features = false, features = ["backends", "inline-more", "std"] }
