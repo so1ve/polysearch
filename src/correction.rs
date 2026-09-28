@@ -174,6 +174,8 @@ impl CorrectionIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use crate::test_support::{entry, result_ids};
     use crate::{Config, IDENTIFIER, Searcher};
 
@@ -206,7 +208,11 @@ mod tests {
         );
 
         assert_eq!(result_ids(&searcher, "sma", 10), [1, 2]);
-        assert!(searcher.search("sms", 10).is_empty());
+        assert!(
+            searcher
+                .search("sms", 10, |_, _| Ordering::Equal)
+                .is_empty()
+        );
     }
 
     #[test]

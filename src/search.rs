@@ -1,6 +1,8 @@
 mod alignment;
 mod matching;
 
+use std::cmp::Ordering;
+
 use matching::Rank;
 use rapidhash::RapidHashMap;
 
@@ -44,8 +46,18 @@ impl Searcher {
         }
     }
 
+    /// Searches by relevance, using `compare` to order equally strong matches.
+    ///
+    /// Built-in match quality takes precedence over `compare`. Length,
+    /// position and entry ID break any remaining ties. Pass
+    /// `|_, _| Ordering::Equal` to use only the built-in ordering.
     #[must_use]
-    pub fn search(&self, input: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search(
+        &self,
+        input: &str,
+        limit: usize,
+        mut compare: impl FnMut(EntryId, EntryId) -> Ordering,
+    ) -> Vec<SearchResult> {
         if limit == 0 || self.config.max_candidates == 0 {
             return Vec::new();
         }
@@ -61,10 +73,10 @@ impl Searcher {
 
         self.collect_matches(&original, original_query_len, &mut best);
 
-        // A correction is a fallback for a weak miss, never a way to fill
-        // remaining result slots after a zero-edit match.
-        let has_strong_match = best.values().any(|(rank, _)| rank.is_strong());
-        if !has_strong_match
+        // Dictionary correction runs only when no accepted match has zero
+        // edits.
+        let has_unedited_match = best.values().any(|(rank, _)| rank.quality.edits == 0);
+        if !has_unedited_match
             && let Some(corrector) = &self.corrector
             && let Some((text, cost)) = corrector.correct(original.text.chars())
         {
@@ -75,18 +87,27 @@ impl Searcher {
             self.collect_matches(&corrected, original_query_len, &mut best);
         }
 
-        let mut results: Vec<_> = best.into_values().collect();
-        results.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut results: Vec<_> = best.into_iter().collect();
+        results.sort_by(|(left_id, (left, _)), (right_id, (right, _))| {
+            left.quality
+                .cmp(&right.quality)
+                .then_with(|| compare(*left_id, *right_id))
+                .then_with(|| left.tie_breaker.cmp(&right.tie_breaker))
+                .then_with(|| left_id.cmp(right_id))
+        });
         results.truncate(limit);
 
-        results.into_iter().map(|(_, result)| result).collect()
+        results
+            .into_iter()
+            .map(|(entry, (_, field))| SearchResult { entry, field })
+            .collect()
     }
 
     fn collect_matches(
         &self,
         query: &Term,
         original_query_len: usize,
-        best: &mut RapidHashMap<EntryId, (Rank, SearchResult)>,
+        best: &mut RapidHashMap<EntryId, (Rank, FieldId)>,
     ) {
         let candidates = self
             .index
@@ -100,31 +121,53 @@ impl Searcher {
             };
             let term = candidate.term;
 
-            if best
-                .get(&term.entry)
-                .is_some_and(|(previous, _)| previous <= &rank)
-            {
-                continue;
-            }
+            let best = best.entry(term.entry).or_insert_with(|| (rank, term.field));
 
-            best.insert(
-                term.entry,
-                (
-                    rank,
-                    SearchResult {
-                        entry: term.entry,
-                        field: term.field,
-                    },
-                ),
-            );
+            if rank < best.0 {
+                *best = (rank, term.field);
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use crate::test_support::{entries, entry, result_ids};
     use crate::{Config, IDENTIFIER, PRIMARY_NAME, Searcher};
+
+    #[test]
+    fn custom_ordering_cannot_promote_weaker_matches() {
+        let searcher = Searcher::new(
+            entries(&["DingTalk", "GTK Demo", "GTK Widget Factory"]),
+            Config::default(),
+        );
+
+        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 3, 1]);
+
+        let results = searcher.search("gtk", 10, |left, right| {
+            let preferred = |id| match id {
+                1 => 0,
+                3 => 1,
+                _ => 2,
+            };
+
+            preferred(left).cmp(&preferred(right))
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.entry)
+                .collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        assert_eq!(
+            searcher.search("gtk", 1, |left, right| right.cmp(&left))[0].entry,
+            3
+        );
+    }
 
     #[test]
     fn correction_and_direct_alignment_use_the_same_edit_cost() {
@@ -155,10 +198,17 @@ mod tests {
 
         for query in ["xapp", "app"] {
             for limit in [0, 1, 20, 600, 1_000] {
-                assert_eq!(searcher.search(query, limit).len(), limit.min(600));
+                assert_eq!(
+                    searcher.search(query, limit, |_, _| Ordering::Equal).len(),
+                    limit.min(600)
+                );
             }
         }
-        assert!(searcher.search(" /-_ ", 10).is_empty());
+        assert!(
+            searcher
+                .search(" /-_ ", 10, |_, _| Ordering::Equal)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -172,7 +222,11 @@ mod tests {
                 },
             );
 
-            assert!(searcher.search("weixni", 5).is_empty());
+            assert!(
+                searcher
+                    .search("weixni", 5, |_, _| Ordering::Equal)
+                    .is_empty()
+            );
             assert_eq!(result_ids(&searcher, "weixin", 5), [1]);
         }
     }

@@ -2,66 +2,22 @@ mod subsequence;
 
 use crate::distance::{MatchLength, damerau_levenshtein};
 
-enum AlignmentKind {
-    Contiguous {
-        crosses_token_boundary: bool,
-        token_starts: bool,
-    },
-    Subsequence {
-        crosses_token_boundary: bool,
-        token_starts: bool,
-        token_progression: bool,
-    },
-    Fuzzy,
-}
-
 pub struct Alignment {
     pub edits: u16,
     pub gaps: u16,
+    pub unmatched: u16,
     pub start: u16,
-    kind: AlignmentKind,
+    pub kind: AlignmentKind,
 }
 
-impl Alignment {
-    pub const fn is_contiguous(&self) -> bool {
-        matches!(self.kind, AlignmentKind::Contiguous { .. })
-    }
-
-    pub const fn crosses_token_boundary(&self) -> bool {
-        match self.kind {
-            AlignmentKind::Contiguous {
-                crosses_token_boundary,
-                ..
-            }
-            | AlignmentKind::Subsequence {
-                crosses_token_boundary,
-                ..
-            } => crosses_token_boundary,
-            AlignmentKind::Fuzzy => false,
-        }
-    }
-
-    pub const fn token_starts(&self) -> bool {
-        match self.kind {
-            AlignmentKind::Contiguous { token_starts, .. }
-            | AlignmentKind::Subsequence { token_starts, .. } => token_starts,
-            AlignmentKind::Fuzzy => false,
-        }
-    }
-
-    pub const fn token_progression(&self) -> bool {
-        matches!(
-            self.kind,
-            AlignmentKind::Subsequence {
-                token_progression: true,
-                ..
-            }
-        ) || self.is_contiguous()
-    }
-}
-
-fn capped(value: usize) -> u16 {
-    value.min(u16::MAX as usize) as u16
+pub enum AlignmentKind {
+    Contiguous,
+    Subsequence,
+    Abbreviation {
+        crosses_token_boundary: bool,
+        initials_only: bool,
+    },
+    Fuzzy,
 }
 
 #[must_use]
@@ -76,15 +32,10 @@ pub fn align(
     if let Some(start) = candidate.windows(query_len).position(|part| part == query) {
         let contiguous = Alignment {
             edits: 0,
-            gaps: capped(candidate.len() - query_len),
-            start: capped(start),
-            kind: AlignmentKind::Contiguous {
-                crosses_token_boundary: token_starts.iter().any(|&boundary| {
-                    usize::from(boundary) > start && usize::from(boundary) < start + query_len
-                }),
-                token_starts: (start..start + query_len)
-                    .all(|position| token_starts.contains(&capped(position))),
-            },
+            gaps: 0,
+            unmatched: (candidate.len() - query_len) as u16,
+            start: start as u16,
+            kind: AlignmentKind::Contiguous,
         };
 
         // A later token-initial path can be more meaningful than an earlier
@@ -96,8 +47,13 @@ pub fn align(
         }
 
         if let Some(subsequence) = subsequence::align(query, candidate, token_starts)
-            && subsequence.crosses_token_boundary()
-            && subsequence.token_progression()
+            && matches!(
+                subsequence.kind,
+                AlignmentKind::Abbreviation {
+                    crosses_token_boundary: true,
+                    ..
+                }
+            )
         {
             return Some(subsequence);
         }
@@ -113,7 +69,8 @@ pub fn align(
 
     Some(Alignment {
         edits,
-        gaps: capped(candidate.len() - end),
+        gaps: 0,
+        unmatched: (candidate.len() - end) as u16,
         start: 0,
         kind: AlignmentKind::Fuzzy,
     })
@@ -121,6 +78,8 @@ pub fn align(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use crate::test_support::{entries, result_ids};
     use crate::{Config, Searcher};
 
@@ -163,7 +122,11 @@ mod tests {
                 );
             }
 
-            assert!(searcher.search("alxormusix", 5).is_empty());
+            assert!(
+                searcher
+                    .search("alxormusix", 5, |_, _| Ordering::Equal)
+                    .is_empty()
+            );
         }
     }
 }

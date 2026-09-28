@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use polysearch::{
     ALIAS, Config, Entry, EntryId, Field, FieldId, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher,
 };
@@ -50,7 +52,7 @@ fn desktop_fields_select_ranked_unique_applications() {
         ("terminal", vec![(2, 21), (3, 31)]),
     ] {
         let matches: Vec<_> = searcher
-            .search(query, 10)
+            .search(query, 10, |_, _| Ordering::Equal)
             .into_iter()
             .map(|result| (result.entry, result.field))
             .collect();
@@ -71,7 +73,7 @@ fn short_substrings_work_across_languages_and_respect_field_roles() {
         ("ile", vec![(1, 10)]),
     ] {
         let matches: Vec<_> = searcher
-            .search(query, 10)
+            .search(query, 10, |_, _| Ordering::Equal)
             .into_iter()
             .map(|result| (result.entry, result.field))
             .collect();
@@ -92,7 +94,7 @@ fn pinyin_queries_keep_the_name_field() {
         ("zed", vec![(5, 50)]),
     ] {
         let matches: Vec<_> = searcher
-            .search(query, 10)
+            .search(query, 10, |_, _| Ordering::Equal)
             .into_iter()
             .map(|result| (result.entry, result.field))
             .collect();

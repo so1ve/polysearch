@@ -8,6 +8,8 @@
 //! Build a [`Searcher`] once and reuse it for queries:
 //!
 //! ```
+//! use std::cmp::Ordering;
+//!
 //! use polysearch::{Config, Entry, Field, PRIMARY_NAME, Searcher};
 //!
 //! let searcher = Searcher::new(
@@ -22,7 +24,7 @@
 //!     Config::default(),
 //! );
 //!
-//! let results = searcher.search("文档", 10);
+//! let results = searcher.search("文档", 10, |_, _| Ordering::Equal);
 //! assert_eq!(results[0].entry, 1);
 //! assert_eq!(results[0].field, 1);
 //! ```
@@ -41,6 +43,10 @@
 //! entry appears once, alongside its best matching field ID. The second
 //! argument limits the result count; an empty query returns no results. Rebuild
 //! the searcher when the indexed data changes.
+//!
+//! The comparison callback applies usage history or other preferences among
+//! equally strong matches. Return [`std::cmp::Ordering::Equal`] to keep the
+//! built-in ordering.
 //!
 //! # Configuration
 //!

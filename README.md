@@ -17,6 +17,8 @@ and local search. Supports prefixes, substrings, abbreviations, and common typos
 ## Example
 
 ```rust
+use std::cmp::Ordering;
+
 use polysearch::{Config, Entry, Field, PRIMARY_NAME, Searcher};
 
 let searcher = Searcher::new(
@@ -31,7 +33,7 @@ let searcher = Searcher::new(
     Config::default(),
 );
 
-let results = searcher.search("文档", 10);
+let results = searcher.search("文档", 10, |_, _| Ordering::Equal);
 for result in results {
     println!("entry={}, field={}", result.entry, result.field);
 }

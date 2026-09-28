@@ -1,4 +1,4 @@
-use super::{Alignment, AlignmentKind, capped};
+use super::{Alignment, AlignmentKind};
 
 #[derive(Clone, Copy)]
 struct SubsequencePath {
@@ -32,7 +32,7 @@ impl SubsequencePath {
 
 pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option<Alignment> {
     if token_starts.len() <= 1 {
-        return greedy(query, candidate, token_starts);
+        return greedy(query, candidate);
     }
 
     if !candidate.contains(&query[0]) {
@@ -85,7 +85,7 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
 
                 local_best = None;
             } else if position > 0 {
-                for path in paths[position - 1].iter().flatten() {
+                if let Some(path) = paths[position - 1][0] {
                     path.retain(&mut local_best);
                 }
 
@@ -117,83 +117,66 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
         std::mem::swap(&mut paths, &mut next);
     }
 
-    let mut best = None;
-
-    for [local, anchored] in paths {
-        for (kind, path) in [local, anchored].into_iter().enumerate() {
-            let Some(path) = path else {
-                continue;
-            };
-
-            let key = (
-                kind,
+    let (path, anchored) = paths
+        .into_iter()
+        .flat_map(|[local, anchored]| [(local, false), (anchored, true)])
+        .filter_map(|(path, anchored)| path.map(|path| (path, anchored)))
+        .max_by_key(|(path, anchored)| {
+            (
+                *anchored,
                 path.token_starts,
                 path.adjacent_steps,
                 std::cmp::Reverse(path.last - path.first),
                 std::cmp::Reverse(path.first),
-            );
+            )
+        })?;
 
-            if best
-                .as_ref()
-                .is_none_or(|(_, previous_key)| key > *previous_key)
-            {
-                best = Some((path, key));
-            }
+    let kind = if anchored {
+        AlignmentKind::Abbreviation {
+            crosses_token_boundary: token_starts.iter().any(|&boundary| {
+                usize::from(boundary) > path.first && usize::from(boundary) <= path.last
+            }),
+            initials_only: path.token_starts == query.len(),
         }
-    }
-
-    let (path, key) = best?;
-    let anchored = key.0 == 1;
-
-    let crosses_token_boundary = token_starts
-        .iter()
-        .any(|&boundary| usize::from(boundary) > path.first && usize::from(boundary) <= path.last);
+    } else {
+        AlignmentKind::Subsequence
+    };
 
     Some(Alignment {
         edits: 0,
-        gaps: capped(path.last - path.first + 1 - query.len()),
-        start: capped(path.first),
-        kind: AlignmentKind::Subsequence {
-            crosses_token_boundary,
-            token_starts: path.token_starts == query.len(),
-            token_progression: anchored,
-        },
+        gaps: (path.last - path.first + 1 - query.len()) as u16,
+        unmatched: (candidate.len() - (path.last - path.first + 1)) as u16,
+        start: path.first as u16,
+        kind,
     })
 }
 
-fn greedy(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option<Alignment> {
-    let mut candidate_index = 0;
-    let mut first = None;
-    let mut last = 0;
-    let mut token_starts_count = 0;
+fn greedy(query: &[char], candidate: &[char]) -> Option<Alignment> {
+    let first = candidate
+        .iter()
+        .position(|&character| character == query[0])?;
+    let mut last = first;
 
-    for character in query {
-        let offset = candidate[candidate_index..]
+    for character in &query[1..] {
+        let offset = candidate[last + 1..]
             .iter()
             .position(|item| item == character)?;
-        let found = candidate_index + offset;
-        first.get_or_insert(found);
-        last = found;
-        token_starts_count += usize::from(token_starts.contains(&capped(found)));
-        candidate_index = found + 1;
+        last += offset + 1;
     }
-
-    let first = first?;
 
     Some(Alignment {
         edits: 0,
-        gaps: capped(last - first + 1 - query.len()),
-        start: capped(first),
-        kind: AlignmentKind::Subsequence {
-            crosses_token_boundary: false,
-            token_starts: token_starts_count == query.len(),
-            token_progression: false,
-        },
+        gaps: (last - first + 1 - query.len()) as u16,
+        unmatched: (candidate.len() - (last - first + 1)) as u16,
+        start: first as u16,
+        kind: AlignmentKind::Subsequence,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use crate::test_support::{entries, result_ids};
     use crate::{Config, Searcher};
 
@@ -210,6 +193,6 @@ mod tests {
 
         assert_eq!(result_ids(&searcher, "vsc", 5), [1]);
         assert_eq!(result_ids(&searcher, "vscd", 5), [1]);
-        assert!(searcher.search("amd", 5).is_empty());
+        assert!(searcher.search("amd", 5, |_, _| Ordering::Equal).is_empty());
     }
 }

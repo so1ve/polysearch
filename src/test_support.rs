@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crate::{Entry, EntryId, Field, FieldId, PRIMARY_NAME, Role, Searcher};
 
 pub fn entry(id: EntryId, fields: Vec<(FieldId, Role, &str)>) -> Entry {
@@ -29,7 +31,7 @@ pub fn entries(names: &[&str]) -> Vec<Entry> {
 
 pub fn result_ids(searcher: &Searcher, query: &str, limit: usize) -> Vec<EntryId> {
     searcher
-        .search(query, limit)
+        .search(query, limit, |_, _| Ordering::Equal)
         .into_iter()
         .map(|result| result.entry)
         .collect()
