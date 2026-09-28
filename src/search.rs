@@ -46,11 +46,10 @@ impl Searcher {
         }
     }
 
-    /// Searches by relevance, using `compare` to order equally strong matches.
+    /// Searches in three tiers: exact matches, completions, then fuzzy matches.
     ///
-    /// Built-in match quality takes precedence over `compare`. Length,
-    /// position and entry ID break any remaining ties. Pass
-    /// `|_, _| Ordering::Equal` to use only the built-in ordering.
+    /// Within each tier, `compare` takes precedence over built-in match
+    /// details. Return `Ordering::Equal` to use only the built-in ordering.
     #[must_use]
     pub fn search(
         &self,
@@ -75,7 +74,7 @@ impl Searcher {
 
         // Dictionary correction runs only when no accepted match has zero
         // edits.
-        let has_unedited_match = best.values().any(|(rank, _)| rank.quality.edits == 0);
+        let has_unedited_match = best.values().any(|(rank, _)| rank.details.edits == 0);
         if !has_unedited_match
             && let Some(corrector) = &self.corrector
             && let Some((text, cost)) = corrector.correct(original.text.chars())
@@ -89,10 +88,10 @@ impl Searcher {
 
         let mut results: Vec<_> = best.into_iter().collect();
         results.sort_by(|(left_id, (left, _)), (right_id, (right, _))| {
-            left.quality
-                .cmp(&right.quality)
+            left.tier
+                .cmp(&right.tier)
                 .then_with(|| compare(*left_id, *right_id))
-                .then_with(|| left.tie_breaker.cmp(&right.tie_breaker))
+                .then_with(|| left.details.cmp(&right.details))
                 .then_with(|| left_id.cmp(right_id))
         });
         results.truncate(limit);
@@ -135,37 +134,40 @@ mod tests {
     use std::cmp::Ordering;
 
     use crate::test_support::{entries, entry, result_ids};
-    use crate::{Config, IDENTIFIER, PRIMARY_NAME, Searcher};
+    use crate::{ALIAS, Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn custom_ordering_cannot_promote_weaker_matches() {
+    fn history_orders_each_tier_before_match_details() {
         let searcher = Searcher::new(
-            entries(&["DingTalk", "GTK Demo", "GTK Widget Factory"]),
+            [
+                entry(1, vec![(1, PRIMARY_NAME, "GTK")]),
+                entry(2, vec![(2, KEYWORD, "GTK Demo")]),
+                entry(3, vec![(3, PRIMARY_NAME, "GTKraken")]),
+                entry(4, vec![(4, ALIAS, "Xgtkview")]),
+                entry(5, vec![(5, PRIMARY_NAME, "General Toolkit")]),
+                entry(6, vec![(6, PRIMARY_NAME, "DingTalk")]),
+                entry(7, vec![(7, PRIMARY_NAME, "GTL")]),
+                entry(8, vec![(8, PRIMARY_NAME, "GetKit Tools")]),
+            ],
             Config::default(),
         );
 
-        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 3, 1]);
+        assert_eq!(result_ids(&searcher, "gtk", 10), [1, 2, 3, 5, 4, 8, 6, 7]);
 
-        let results = searcher.search("gtk", 10, |left, right| {
-            let preferred = |id| match id {
-                1 => 0,
-                3 => 1,
-                _ => 2,
-            };
-
-            preferred(left).cmp(&preferred(right))
-        });
+        // Strongest history favors the weakest tier. Within each tier it
+        // overrides field roles, prefix/substring distinctions and edit cost.
+        let results = searcher.search("gtk", 10, |left, right| right.cmp(&left));
 
         assert_eq!(
             results
                 .iter()
                 .map(|result| result.entry)
                 .collect::<Vec<_>>(),
-            [3, 2, 1]
+            [2, 1, 5, 4, 3, 8, 7, 6]
         );
         assert_eq!(
             searcher.search("gtk", 1, |left, right| right.cmp(&left))[0].entry,
-            3
+            2
         );
     }
 

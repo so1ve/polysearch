@@ -44,9 +44,15 @@
 //! argument limits the result count; an empty query returns no results. Rebuild
 //! the searcher when the indexed data changes.
 //!
-//! The comparison callback applies usage history or other preferences among
-//! equally strong matches. Return [`std::cmp::Ordering::Equal`] to keep the
-//! built-in ordering.
+//! Results are grouped into three tiers:
+//!
+//! 1. Exact names or whole tokens, without spelling edits.
+//! 2. Prefixes, contiguous substrings, and token-initial abbreviations.
+//! 3. Typo corrections and loose subsequences.
+//!
+//! Pinyin follows the same rules. Within each tier, the comparison callback
+//! applies usage history or other preferences before built-in match details.
+//! Return [`std::cmp::Ordering::Equal`] to keep the built-in ordering.
 //!
 //! # Configuration
 //!

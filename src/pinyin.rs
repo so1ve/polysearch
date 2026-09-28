@@ -151,6 +151,30 @@ mod tests {
     use crate::{Config, Searcher};
 
     #[test]
+    fn pinyin_uses_the_same_tiers_as_literal_text() {
+        let searcher = Searcher::new(
+            entries(&["bj", "笔记", "bjtool", "bijitool"]),
+            Config::default(),
+        );
+
+        assert_eq!(result_ids(&searcher, "bj", 10), [1, 2, 3, 4]);
+
+        let results = searcher.search("bj", 10, |left, right| right.cmp(&left));
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.entry)
+                .collect::<Vec<_>>(),
+            [2, 1, 3, 4]
+        );
+        assert_eq!(
+            searcher.search("biji", 1, |left, right| right.cmp(&left))[0].entry,
+            2
+        );
+    }
+
+    #[test]
     fn alternative_readings_are_searchable() {
         let searcher = Searcher::new(
             entries(&["银行"]),

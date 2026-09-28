@@ -5,8 +5,8 @@ use crate::terms::Term;
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Rank {
-    pub quality: Quality,
-    pub tie_breaker: TieBreaker,
+    pub tier: Tier,
+    pub details: Details,
 }
 
 impl Rank {
@@ -72,7 +72,11 @@ impl Rank {
                     }
                 }
 
-                MatchKind::Abbreviation
+                if crosses_token_boundary {
+                    MatchKind::Abbreviation
+                } else {
+                    MatchKind::Subsequence
+                }
             }
             AlignmentKind::Subsequence => {
                 if !role.allow_substring
@@ -100,15 +104,22 @@ impl Rank {
             kind
         };
 
+        let edits = query.cost + alignment.edits;
+        let tier = if edits > 0 || kind == MatchKind::Subsequence {
+            Tier::Fuzzy
+        } else if kind == MatchKind::Exact {
+            Tier::Exact
+        } else {
+            Tier::Completion
+        };
+
         Some(Self {
-            quality: Quality {
-                edits: query.cost + alignment.edits,
-                loose: kind == MatchKind::Subsequence,
+            tier,
+            details: Details {
+                edits,
                 role: role.priority,
                 kind,
                 cost: term.cost,
-            },
-            tie_breaker: TieBreaker {
                 gaps: alignment.gaps,
                 unmatched: alignment.unmatched,
                 start: alignment.start,
@@ -118,19 +129,20 @@ impl Rank {
     }
 }
 
-// Field order defines relevance: spelling, structured matches, field role,
-// match kind, then representation cost. History cannot override these.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Quality {
+pub enum Tier {
+    Exact,
+    Completion,
+    Fuzzy,
+}
+
+// Field order breaks ties only after the tier and caller's preference.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Details {
     pub edits: u16,
-    loose: bool,
     role: u8,
     kind: MatchKind,
     cost: u16,
-}
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub struct TieBreaker {
     gaps: u16,
     unmatched: u16,
     start: u16,
@@ -154,7 +166,7 @@ mod tests {
     use crate::{Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn direct_matches_outrank_incidental_name_subsequences() {
+    fn exact_matches_outrank_completions_and_subsequences() {
         let searcher = Searcher::new(
             [
                 entry(1, vec![(1, PRIMARY_NAME, "DingTalk")]),
@@ -168,7 +180,7 @@ mod tests {
             Config::default(),
         );
 
-        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 3, 4, 1]);
+        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 4, 3, 1]);
     }
 
     #[test]
