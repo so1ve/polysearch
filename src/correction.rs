@@ -18,88 +18,6 @@ type DeleteKey = ArrayString<MAX_DELETE_KEY_BYTES>;
 type PostingList = SmallVec<[SymbolU32; 1]>;
 type Interner = StringInterner<StringBackend<SymbolU32>, RapidState>;
 
-struct DeleteKeys(ArrayVec<DeleteKey, MAX_DELETE_KEYS>);
-
-impl DeleteKeys {
-    fn push(&mut self, prefix: &[char], first: Option<usize>, second: Option<usize>) {
-        let mut key = DeleteKey::new();
-
-        for (index, &character) in prefix.iter().enumerate() {
-            if Some(index) != first && Some(index) != second {
-                key.push(character);
-            }
-        }
-
-        if !self.0.contains(&key) {
-            self.0.push(key);
-        }
-    }
-
-    fn new(chars: &[char], max_edits: u16) -> Self {
-        let prefix = &chars[..chars.len().min(DELETE_PREFIX_LENGTH)];
-        let mut keys = Self(ArrayVec::new());
-
-        keys.push(prefix, None, None);
-
-        for first in 0..prefix.len() {
-            keys.push(prefix, Some(first), None);
-
-            if max_edits > 1 {
-                for second in first + 1..prefix.len() {
-                    keys.push(prefix, Some(first), Some(second));
-                }
-            }
-        }
-
-        keys
-    }
-}
-
-impl IntoIterator for DeleteKeys {
-    type Item = DeleteKey;
-    type IntoIter = arrayvec::IntoIter<DeleteKey, MAX_DELETE_KEYS>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-struct Corrections<'a> {
-    term: Option<&'a str>,
-    cost: u16,
-}
-
-impl<'a> Corrections<'a> {
-    const fn new() -> Self {
-        Self {
-            term: None,
-            cost: u16::MAX,
-        }
-    }
-
-    fn consider(&mut self, term: &'a str, query: &[char], max_edits: u16) {
-        let chars: Vec<_> = term.chars().collect();
-        let Some((cost, _)) = damerau_levenshtein(query, &chars, max_edits, MatchLength::Full)
-        else {
-            return;
-        };
-
-        if cost == 0 || cost > self.cost {
-            return;
-        }
-
-        if cost < self.cost {
-            self.term = Some(term);
-            self.cost = cost;
-
-            return;
-        }
-
-        // A tied minimum is ambiguous; only a lower cost can replace it.
-        self.term = None;
-    }
-}
-
 /// Looks up bounded edit-distance variants in the finished index vocabulary.
 pub struct CorrectionIndex {
     max_edits: u16,
@@ -109,7 +27,6 @@ pub struct CorrectionIndex {
 }
 
 impl CorrectionIndex {
-    #[must_use]
     pub fn new(vocabulary: &[&str], max_edits: u16) -> Self {
         let mut corrector = Self {
             max_edits,
@@ -120,14 +37,16 @@ impl CorrectionIndex {
 
         for term in vocabulary {
             let term_symbol = corrector.terms.get_or_intern(term);
+
             // Larger budgets use the complete vocabulary instead of an
             // exponentially larger deletion index.
             if max_edits > MAX_INDEXED_EDITS {
                 continue;
             }
+
             let chars: Vec<_> = term.chars().collect();
 
-            for key in DeleteKeys::new(&chars, max_edits) {
+            for key in delete_keys(&chars, max_edits) {
                 let delete_symbol = corrector.delete_keys.get_or_intern(key.as_str());
                 let posting = delete_symbol.to_usize();
 
@@ -143,16 +62,34 @@ impl CorrectionIndex {
     }
 
     pub fn correct(&self, query: &[char]) -> Option<(&str, u16)> {
-        let mut corrections = Corrections::new();
+        let mut best = None;
+        let mut best_cost = u16::MAX;
+        let mut consider = |symbol, term: &str| {
+            let chars: Vec<_> = term.chars().collect();
+            let Some((cost, _)) =
+                damerau_levenshtein(query, &chars, self.max_edits, MatchLength::Full)
+            else {
+                return;
+            };
+
+            if cost == 0 || cost > best_cost {
+                return;
+            }
+
+            // An equally close word makes the correction ambiguous. Only a
+            // strictly better word can make it unambiguous again.
+            best = (cost < best_cost).then_some(symbol);
+            best_cost = cost;
+        };
 
         if self.max_edits > MAX_INDEXED_EDITS {
-            for (_, term) in self.terms.iter() {
-                corrections.consider(term, query, self.max_edits);
+            for (symbol, term) in self.terms.iter() {
+                consider(symbol, term);
             }
         } else {
             let mut seen = RapidHashSet::default();
 
-            for key in DeleteKeys::new(query, self.max_edits) {
+            for key in delete_keys(query, self.max_edits) {
                 let Some(delete_symbol) = self.delete_keys.get(key.as_str()) else {
                     continue;
                 };
@@ -163,13 +100,45 @@ impl CorrectionIndex {
                     }
 
                     let term = self.terms.resolve(term_symbol).unwrap();
-                    corrections.consider(term, query, self.max_edits);
+                    consider(term_symbol, term);
                 }
             }
         }
 
-        corrections.term.map(|term| (term, corrections.cost))
+        best.map(|symbol| (self.terms.resolve(symbol).unwrap(), best_cost))
     }
+}
+
+fn delete_keys(chars: &[char], max_edits: u16) -> ArrayVec<DeleteKey, MAX_DELETE_KEYS> {
+    let prefix = &chars[..chars.len().min(DELETE_PREFIX_LENGTH)];
+    let mut keys = ArrayVec::new();
+    let mut add = |first: Option<usize>, second: Option<usize>| {
+        let mut key = DeleteKey::new();
+
+        for (index, &character) in prefix.iter().enumerate() {
+            if Some(index) != first && Some(index) != second {
+                key.push(character);
+            }
+        }
+
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+
+    add(None, None);
+
+    for first in 0..prefix.len() {
+        add(Some(first), None);
+
+        if max_edits > 1 {
+            for second in first + 1..prefix.len() {
+                add(Some(first), Some(second));
+            }
+        }
+    }
+
+    keys
 }
 
 #[cfg(test)]

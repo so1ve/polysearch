@@ -1,47 +1,56 @@
-use super::alignment::{AlignmentKind, align};
-use crate::config::Config;
-use crate::index::{Candidate, TokenMatch};
-use crate::terms::Term;
+mod alignment;
+mod subsequence;
 
+use alignment::{AlignmentKind, align};
+
+use crate::index::{Candidate, TokenMatch};
+
+// Field order supplies tie-breakers after the tier and caller preference.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Rank {
     pub tier: Tier,
-    pub details: Details,
+    pub edits: u16,
+    role: u8,
+    kind: MatchKind,
+    penalty: u16,
+    gaps: u16,
+    unmatched: u16,
+    start: u16,
+    frequency: u16,
 }
 
 impl Rank {
     pub fn for_candidate(
-        query: &Term,
+        query: &[char],
         candidate: &Candidate<'_>,
         original_query_len: usize,
-        config: &Config,
+        correction_edits: u16,
+        max_edits: u16,
     ) -> Option<Self> {
         let term = candidate.term;
         let role = term.role;
 
-        if original_query_len.min(query.text.len()) < usize::from(role.min_query_chars) {
+        if original_query_len.min(query.len()) < usize::from(role.min_query_chars) {
             return None;
         }
 
-        // Corrected queries carry a positive cost and may match only a whole
-        // term or token. They must not turn a guessed word into a new prefix.
-        if query.cost > 0 {
+        // A corrected query must match a whole term or token; a guessed word
+        // must not introduce new prefix completions.
+        if correction_edits > 0 {
             if !role.allow_correction {
                 return None;
             }
 
-            if term.chars.as_ref() != query.text.chars()
-                && candidate.token != Some(TokenMatch::Exact)
-            {
+            if term.chars.as_ref() != query && candidate.token != Some(TokenMatch::Exact) {
                 return None;
             }
         }
 
         let alignment = align(
-            query.text.chars(),
+            query,
             &term.chars,
             &term.token_starts,
-            config.max_edits - query.cost,
+            max_edits - correction_edits,
         )?;
 
         let kind = match alignment.kind {
@@ -54,29 +63,12 @@ impl Rank {
                     return None;
                 }
             }
-            AlignmentKind::Abbreviation {
-                crosses_token_boundary,
-                initials_only,
-            } => {
-                if !role.allow_substring {
+            AlignmentKind::Abbreviation { initials_only } => {
+                if !role.allow_substring || (original_query_len < 3 && !initials_only) {
                     return None;
                 }
 
-                if original_query_len < 3 {
-                    let acronym = crosses_token_boundary && initials_only;
-                    let near_start =
-                        !crosses_token_boundary && alignment.start == 0 && alignment.gaps <= 1;
-
-                    if !acronym && !near_start {
-                        return None;
-                    }
-                }
-
-                if crosses_token_boundary {
-                    MatchKind::Abbreviation
-                } else {
-                    MatchKind::Subsequence
-                }
+                MatchKind::Abbreviation
             }
             AlignmentKind::Subsequence => {
                 if !role.allow_substring
@@ -88,7 +80,7 @@ impl Rank {
                 MatchKind::Subsequence
             }
             AlignmentKind::Fuzzy => {
-                if !role.allow_substring || !role.allow_fuzzy || query.text.len() < 3 {
+                if !role.allow_substring {
                     return None;
                 }
 
@@ -104,7 +96,7 @@ impl Rank {
             kind
         };
 
-        let edits = query.cost + alignment.edits;
+        let edits = correction_edits + alignment.edits;
         let tier = if edits > 0 || kind == MatchKind::Subsequence {
             Tier::Fuzzy
         } else if kind == MatchKind::Exact {
@@ -115,16 +107,14 @@ impl Rank {
 
         Some(Self {
             tier,
-            details: Details {
-                edits,
-                role: role.priority,
-                kind,
-                cost: term.cost,
-                gaps: alignment.gaps,
-                unmatched: alignment.unmatched,
-                start: alignment.start,
-                frequency: term.frequency.min(u32::from(u16::MAX)) as u16,
-            },
+            edits,
+            role: role.priority,
+            kind,
+            penalty: term.penalty,
+            gaps: alignment.gaps,
+            unmatched: alignment.unmatched,
+            start: alignment.start,
+            frequency: term.frequency.min(u32::from(u16::MAX)) as u16,
         })
     }
 }
@@ -134,19 +124,6 @@ pub enum Tier {
     Exact,
     Completion,
     Fuzzy,
-}
-
-// Field order breaks ties only after the tier and caller's preference.
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Details {
-    pub edits: u16,
-    role: u8,
-    kind: MatchKind,
-    cost: u16,
-    gaps: u16,
-    unmatched: u16,
-    start: u16,
-    frequency: u16,
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]

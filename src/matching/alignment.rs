@@ -1,5 +1,4 @@
-mod subsequence;
-
+use super::subsequence;
 use crate::distance::{MatchLength, damerau_levenshtein};
 
 pub struct Alignment {
@@ -13,14 +12,10 @@ pub struct Alignment {
 pub enum AlignmentKind {
     Contiguous,
     Subsequence,
-    Abbreviation {
-        crosses_token_boundary: bool,
-        initials_only: bool,
-    },
+    Abbreviation { initials_only: bool },
     Fuzzy,
 }
 
-#[must_use]
 pub fn align(
     query: &[char],
     candidate: &[char],
@@ -47,13 +42,7 @@ pub fn align(
         }
 
         if let Some(subsequence) = subsequence::align(query, candidate, token_starts)
-            && matches!(
-                subsequence.kind,
-                AlignmentKind::Abbreviation {
-                    crosses_token_boundary: true,
-                    ..
-                }
-            )
+            && matches!(subsequence.kind, AlignmentKind::Abbreviation { .. })
         {
             return Some(subsequence);
         }

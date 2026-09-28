@@ -5,15 +5,50 @@ use pinyin_pro::options::{
 use pinyin_pro::pinyin::pinyin;
 use pinyin_pro::pinyin_utils::strip_tone;
 
-use crate::terms::Terms;
-
-const FULL_PINYIN_COST: u16 = 18;
-const INITIALS_COST: u16 = 28;
-const ALTERNATIVE_PINYIN_COST: u16 = 22;
-const ALTERNATIVE_INITIALS_COST: u16 = 32;
+const FULL_PINYIN_PENALTY: u16 = 18;
+const INITIALS_PENALTY: u16 = 28;
+const ALTERNATIVE_PINYIN_PENALTY: u16 = 22;
+const ALTERNATIVE_INITIALS_PENALTY: u16 = 32;
 const MAX_READINGS: usize = 8;
 
-/// 多音字
+pub fn expand(input: &str, mut emit: impl FnMut(&str, u16)) {
+    if !input.chars().any(is_han) {
+        return;
+    }
+
+    let read = |pattern| {
+        let options = PinyinOptions {
+            pattern,
+            tone_type: ToneType::None,
+            type_mode: TypeMode::Str,
+            v: VMode::V,
+            non_zh: NonZh::Consecutive,
+            traditional: true,
+            ..PinyinOptions::default()
+        };
+
+        let PinyinOutput::Str(value) = pinyin(input, options) else {
+            unreachable!();
+        };
+
+        value
+    };
+
+    emit(&read(PatternKind::Pinyin), FULL_PINYIN_PENALTY);
+
+    let alternatives = AlternativeReadings::new(input);
+
+    for reading in alternatives.full {
+        emit(&reading, ALTERNATIVE_PINYIN_PENALTY);
+    }
+
+    emit(&read(PatternKind::First), INITIALS_PENALTY);
+
+    for reading in alternatives.initials {
+        emit(&reading, ALTERNATIVE_INITIALS_PENALTY);
+    }
+}
+
 struct AlternativeReadings {
     full: Vec<String>,
     initials: Vec<String>,
@@ -21,6 +56,20 @@ struct AlternativeReadings {
 }
 
 impl AlternativeReadings {
+    fn new(input: &str) -> Self {
+        let mut readings = Self {
+            full: vec![String::new()],
+            initials: vec![String::new()],
+            previous_han: false,
+        };
+
+        for ch in input.chars() {
+            readings.push(ch);
+        }
+
+        readings
+    }
+
     fn push(&mut self, ch: char) {
         let han = is_han(ch);
         let mut options = if han {
@@ -78,60 +127,6 @@ impl AlternativeReadings {
         }
 
         self.previous_han = han;
-    }
-
-    fn new(input: &str) -> Self {
-        let mut readings = Self {
-            full: vec![String::new()],
-            initials: vec![String::new()],
-            previous_han: false,
-        };
-
-        for ch in input.chars() {
-            readings.push(ch);
-        }
-
-        readings
-    }
-}
-
-pub fn expand(input: &str, terms: &mut Terms) {
-    if !input.chars().any(is_han) {
-        return;
-    }
-
-    let read = |pattern| {
-        let options = PinyinOptions {
-            pattern,
-            tone_type: ToneType::None,
-            type_mode: TypeMode::Str,
-            v: VMode::V,
-            non_zh: NonZh::Consecutive,
-            traditional: true,
-            ..PinyinOptions::default()
-        };
-
-        let PinyinOutput::Str(value) = pinyin(input, options) else {
-            unreachable!();
-        };
-
-        value
-    };
-
-    let primary = read(PatternKind::Pinyin);
-    terms.add(&primary, FULL_PINYIN_COST);
-
-    let alternatives = AlternativeReadings::new(input);
-
-    for reading in alternatives.full {
-        terms.add(&reading, ALTERNATIVE_PINYIN_COST);
-    }
-
-    let initials = read(PatternKind::First);
-    terms.add(&initials, INITIALS_COST);
-
-    for reading in alternatives.initials {
-        terms.add(&reading, ALTERNATIVE_INITIALS_COST);
     }
 }
 

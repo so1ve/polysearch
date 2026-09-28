@@ -69,21 +69,100 @@
 //!
 //! - **`pinyin`**: matches Chinese names by full pinyin and initials.
 
-mod config;
 mod correction;
 mod distance;
 mod index;
-mod model;
-#[cfg(feature = "pinyin")]
-mod pinyin;
+mod matching;
 mod search;
-mod terms;
 #[cfg(test)]
 mod test_support;
 mod text;
 
-pub use config::Config;
-pub use model::{
-    ALIAS, Entry, EntryId, Field, FieldId, IDENTIFIER, KEYWORD, LOCALIZED_NAME, PRIMARY_NAME, Role,
-};
 pub use search::{SearchResult, Searcher};
+
+pub type EntryId = u64;
+pub type FieldId = u32;
+
+/// A field's purpose, with fixed matching rules and ranking priority.
+///
+/// Use one of the built-in constants; roles cannot be customized.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Role {
+    priority: u8,
+    min_query_chars: u8,
+    allow_substring: bool,
+    allow_correction: bool,
+}
+
+/// The entry's main display name.
+pub const PRIMARY_NAME: Role = Role {
+    priority: 0,
+    min_query_chars: 1,
+    allow_substring: true,
+    allow_correction: true,
+};
+
+/// An alternate localized name.
+pub const LOCALIZED_NAME: Role = Role {
+    priority: 1,
+    ..PRIMARY_NAME
+};
+
+/// An alternate name or synonym.
+pub const ALIAS: Role = Role {
+    priority: 2,
+    min_query_chars: 2,
+    ..PRIMARY_NAME
+};
+
+/// Keywords or descriptive text; excluded from dictionary correction.
+pub const KEYWORD: Role = Role {
+    priority: 3,
+    min_query_chars: 2,
+    allow_substring: false,
+    allow_correction: false,
+};
+
+/// A technical identifier, matched by prefixes and whole-token correction.
+pub const IDENTIFIER: Role = Role {
+    priority: 5,
+    min_query_chars: 3,
+    allow_substring: false,
+    allow_correction: true,
+};
+
+#[derive(Clone, Debug)]
+pub struct Field {
+    pub id: FieldId,
+    pub role: Role,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub id: EntryId,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Maximum terms evaluated per retrieval pass, including a correction
+    /// pass when needed. Defaults to no truncation; a finite cap trades
+    /// recall for less work. Results are limited by `Searcher::search`.
+    pub max_candidates: usize,
+    /// Maximum total edits from query correction and fuzzy alignment.
+    /// Zero disables both; prefixes and subsequences remain available.
+    pub max_edits: u16,
+    /// Proposes a correction only when no accepted result has zero edits.
+    pub enable_correction: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_candidates: usize::MAX,
+            max_edits: 2,
+            enable_correction: true,
+        }
+    }
+}

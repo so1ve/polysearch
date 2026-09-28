@@ -1,34 +1,25 @@
 mod candidates;
+#[cfg(feature = "pinyin")]
+mod pinyin;
+mod terms;
 
 use std::collections::BTreeMap;
 
 use rapidhash::{RapidHashMap, RapidHashSet};
 use smallvec::SmallVec;
 
-use crate::model::{Entry, EntryId, FieldId, Role};
-use crate::terms::Terms;
+use crate::{Entry, EntryId, Field, FieldId, Role};
 
-fn bigrams(chars: &[char]) -> impl Iterator<Item = [char; 2]> {
-    chars.windows(2).map(|pair| [pair[0], pair[1]])
-}
+const MAX_INDEXED_TOKENS: usize = 32;
 
-fn near_pairs(chars: &[char]) -> impl Iterator<Item = [char; 2]> {
-    chars.iter().enumerate().flat_map(move |(first, &left)| {
-        chars[first + 1..]
-            .iter()
-            .take(2)
-            .map(move |&right| [left, right])
-    })
-}
-
-/// An indexed term with the source and frequency needed to evaluate it.
+/// A spelling and its source field, shared by retrieval and matching.
 pub struct IndexedTerm {
     pub entry: EntryId,
     pub field: FieldId,
     pub role: Role,
     pub chars: Box<[char]>,
     pub token_starts: SmallVec<[u16; 4]>,
-    pub cost: u16,
+    pub penalty: u16,
     pub frequency: u32,
 }
 
@@ -64,115 +55,110 @@ impl Index {
             token_initials: RapidHashMap::default(),
             tokens: BTreeMap::new(),
         };
-
         let mut entry_ids = RapidHashSet::default();
         let mut field_ids = RapidHashSet::default();
+
         for entry in entries {
             assert!(entry_ids.insert(entry.id), "duplicate entry id");
 
             for field in entry.fields {
                 assert!(field_ids.insert(field.id), "duplicate field id");
-
-                let field_terms = Terms::new(&field.text, 32, 4_096);
-
-                #[cfg(feature = "pinyin")]
-                let field_terms = {
-                    let mut terms = field_terms;
-                    crate::pinyin::expand(&field.text, &mut terms);
-
-                    terms
-                };
-
-                for value in field_terms.values {
-                    let id = u32::try_from(index.terms.len()).expect("too many indexed terms");
-                    let key = value.text.match_key();
-
-                    index.sorted_terms.entry(key).or_default().push(id);
-
-                    let chars = value.text.chars().to_vec().into_boxed_slice();
-                    let mut token_starts = SmallVec::new();
-                    let mut start = 0;
-                    let mut retained_tokens = 0;
-
-                    for token in value.text.as_str().split_whitespace() {
-                        let len = token.chars().count();
-                        token_starts.push(start as u16);
-                        let initial = token.chars().next().unwrap();
-                        let postings = index.token_initials.entry(initial).or_default();
-
-                        if postings.last() != Some(&id) {
-                            postings.push(id);
-                        }
-
-                        if value.cost == 0 && len > 1 && retained_tokens < 32 {
-                            index.tokens.entry(token.into()).or_default().push(id);
-                            retained_tokens += 1;
-                        }
-
-                        start += len;
-                    }
-
-                    for bigram in bigrams(&chars) {
-                        index.bigrams.entry(bigram).or_default().push(id);
-                    }
-
-                    if value.cost == 0 {
-                        for pair in near_pairs(&chars) {
-                            let postings = index.near_pairs.entry(pair).or_default();
-
-                            if postings.last() != Some(&id) {
-                                postings.push(id);
-                            }
-                        }
-                    }
-
-                    for &character in chars.iter() {
-                        let postings = index.characters.entry(character).or_default();
-
-                        if postings.last() != Some(&id) {
-                            postings.push(id);
-                        }
-                    }
-
-                    index.terms.push(IndexedTerm {
-                        entry: entry.id,
-                        field: field.id,
-                        role: field.role,
-                        chars,
-                        token_starts,
-                        cost: value.cost,
-                        frequency: 0,
-                    });
-                }
+                index.insert(entry.id, &field);
             }
         }
 
-        // Terms keep entry order, so the last ID is enough to suppress
-        // duplicate fields while computing each role's document frequency.
-        for term_ids in index.sorted_terms.values() {
-            let mut frequencies = RapidHashMap::default();
-
-            for &id in term_ids {
-                let term = &index.terms[id as usize];
-                let frequency = frequencies.entry(term.role).or_insert((term.entry, 1));
-
-                if frequency.0 != term.entry {
-                    frequency.0 = term.entry;
-                    frequency.1 += 1;
-                }
-            }
-
-            for &id in term_ids {
-                let term = &mut index.terms[id as usize];
-                term.frequency = frequencies[&term.role].1;
-            }
-        }
+        index.set_frequencies();
 
         index
     }
 
-    /// Distinct matching keys for terms and tokens actually retained in the
-    /// index.
+    fn insert(&mut self, entry: EntryId, field: &Field) {
+        for term in terms::expand(&field.text) {
+            let id = u32::try_from(self.terms.len()).expect("too many indexed terms");
+            let text = term.text;
+            let key = text.match_key();
+            let chars = text.chars.into_boxed_slice();
+            let mut token_starts = SmallVec::new();
+            let mut start = 0;
+            let mut retained_tokens = 0;
+
+            self.sorted_terms.entry(key).or_default().push(id);
+
+            for token in text.text.split_whitespace() {
+                let len = token.chars().count();
+                token_starts.push(start as u16);
+                let initial = token.chars().next().unwrap();
+                let postings = self.token_initials.entry(initial).or_default();
+
+                if postings.last() != Some(&id) {
+                    postings.push(id);
+                }
+
+                if term.penalty == 0 && len > 1 && retained_tokens < MAX_INDEXED_TOKENS {
+                    self.tokens.entry(token.into()).or_default().push(id);
+                    retained_tokens += 1;
+                }
+
+                start += len;
+            }
+
+            for bigram in bigrams(&chars) {
+                self.bigrams.entry(bigram).or_default().push(id);
+            }
+
+            if term.penalty == 0 {
+                for pair in near_pairs(&chars) {
+                    let postings = self.near_pairs.entry(pair).or_default();
+
+                    if postings.last() != Some(&id) {
+                        postings.push(id);
+                    }
+                }
+            }
+
+            for &character in &chars {
+                let postings = self.characters.entry(character).or_default();
+
+                if postings.last() != Some(&id) {
+                    postings.push(id);
+                }
+            }
+
+            self.terms.push(IndexedTerm {
+                entry,
+                field: field.id,
+                role: field.role,
+                chars,
+                token_starts,
+                penalty: term.penalty,
+                frequency: 0,
+            });
+        }
+    }
+
+    fn set_frequencies(&mut self) {
+        // Fields from each entry are contiguous, so a last-entry ID is enough
+        // to count distinct entries for each spelling and role.
+        for term_ids in self.sorted_terms.values() {
+            let mut frequencies = RapidHashMap::default();
+
+            for &id in term_ids {
+                let term = &self.terms[id as usize];
+                let (last_entry, count) = frequencies.entry(term.role).or_insert((term.entry, 1));
+
+                if *last_entry != term.entry {
+                    *last_entry = term.entry;
+                    *count += 1;
+                }
+            }
+
+            for &id in term_ids {
+                let term = &mut self.terms[id as usize];
+                term.frequency = frequencies[&term.role].1;
+            }
+        }
+    }
+
     pub fn vocabulary(&self) -> Vec<&str> {
         let mut words: Vec<_> = self
             .sorted_terms
@@ -185,6 +171,19 @@ impl Index {
 
         words
     }
+}
+
+fn bigrams(chars: &[char]) -> impl Iterator<Item = [char; 2]> {
+    chars.windows(2).map(|pair| [pair[0], pair[1]])
+}
+
+fn near_pairs(chars: &[char]) -> impl Iterator<Item = [char; 2]> {
+    chars.iter().enumerate().flat_map(move |(first, &left)| {
+        chars[first + 1..]
+            .iter()
+            .take(2)
+            .map(move |&right| [left, right])
+    })
 }
 
 #[cfg(test)]

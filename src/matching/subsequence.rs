@@ -1,33 +1,38 @@
-use super::{Alignment, AlignmentKind};
+use super::alignment::{Alignment, AlignmentKind};
 
 #[derive(Clone, Copy)]
-struct SubsequencePath {
+struct Path {
     first: usize,
     last: usize,
-    token_starts: usize,
-    adjacent_steps: usize,
+    initials: usize,
+    adjacent: usize,
 }
 
-impl SubsequencePath {
+impl Path {
     fn extend(self, position: usize, token_start: bool) -> Self {
         Self {
             first: self.first,
             last: position,
-            token_starts: self.token_starts + usize::from(token_start),
-            adjacent_steps: self.adjacent_steps + usize::from(position == self.last + 1),
+            initials: self.initials + usize::from(token_start),
+            adjacent: self.adjacent + usize::from(position == self.last + 1),
         }
     }
 
     fn retain(self, best: &mut Option<Self>) {
-        // All extensions of these paths end at the same position. A later
-        // first character then gives a shorter span, independent of the
-        // previous endpoint. Adjacent extensions are considered separately.
-        let key = |path: Self| (path.token_starts, path.adjacent_steps, path.first);
+        // Prefer more token initials and adjacent steps. For otherwise
+        // equal paths, a later first character gives the shorter span.
+        let key = |path: Self| (path.initials, path.adjacent, path.first);
 
         if best.is_none_or(|previous| key(self) > key(previous)) {
             *best = Some(self);
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Paths {
+    local: Option<Path>,
+    anchored: Option<Path>,
 }
 
 pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option<Alignment> {
@@ -49,21 +54,21 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
     // may enter subsequent tokens only at their first character. Keeping both
     // prevents an earlier internal letter from hiding a valid acronym, as the
     // first 's' in Visual would do for "vsc".
-    let mut paths = vec![[None; 2]; candidate.len()];
+    let mut paths = vec![Paths::default(); candidate.len()];
     let mut next = paths.clone();
 
     for (position, &character) in candidate.iter().enumerate() {
         if character == query[0] {
-            let path = SubsequencePath {
+            let path = Path {
                 first: position,
                 last: position,
-                token_starts: usize::from(starts[position]),
-                adjacent_steps: 0,
+                initials: usize::from(starts[position]),
+                adjacent: 0,
             };
-            paths[position][0] = Some(path);
+            paths[position].local = Some(path);
 
             if starts[position] {
-                paths[position][1] = Some(path);
+                paths[position].anchored = Some(path);
             }
         }
     }
@@ -71,30 +76,30 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
     // Prefix-best states make every row linear in candidate length. There is
     // no query-length threshold that changes the matching semantics.
     for &character in &query[1..] {
-        let mut local_best: Option<SubsequencePath> = None;
-        let mut anchored_best: Option<SubsequencePath> = None;
-        let mut anchored_current: Option<SubsequencePath> = None;
+        let mut local_best: Option<Path> = None;
+        let mut earlier_tokens: Option<Path> = None;
+        let mut current_token: Option<Path> = None;
 
         for (position, &candidate_character) in candidate.iter().enumerate() {
             let token_start = starts[position];
 
             if token_start {
-                if let Some(path) = anchored_current.take() {
-                    path.retain(&mut anchored_best);
+                if let Some(path) = current_token.take() {
+                    path.retain(&mut earlier_tokens);
                 }
 
                 local_best = None;
             } else if position > 0 {
-                if let Some(path) = paths[position - 1][0] {
+                if let Some(path) = paths[position - 1].local {
                     path.retain(&mut local_best);
                 }
 
-                if let Some(path) = paths[position - 1][1] {
-                    path.retain(&mut anchored_current);
+                if let Some(path) = paths[position - 1].anchored {
+                    path.retain(&mut current_token);
                 }
             }
 
-            next[position] = [None; 2];
+            next[position] = Paths::default();
 
             if candidate_character != character {
                 continue;
@@ -102,15 +107,17 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
 
             if let Some(path) = local_best {
                 path.extend(position, token_start)
-                    .retain(&mut next[position][0]);
+                    .retain(&mut next[position].local);
             }
 
             if token_start {
-                if let Some(path) = anchored_best {
-                    path.extend(position, true).retain(&mut next[position][1]);
+                if let Some(path) = earlier_tokens {
+                    path.extend(position, true)
+                        .retain(&mut next[position].anchored);
                 }
-            } else if let Some(path) = anchored_current {
-                path.extend(position, false).retain(&mut next[position][1]);
+            } else if let Some(path) = current_token {
+                path.extend(position, false)
+                    .retain(&mut next[position].anchored);
             }
         }
 
@@ -118,25 +125,28 @@ pub fn align(query: &[char], candidate: &[char], token_starts: &[u16]) -> Option
     }
 
     let (path, anchored) = paths
-        .into_iter()
-        .flat_map(|[local, anchored]| [(local, false), (anchored, true)])
+        .iter()
+        .flat_map(|paths| {
+            [
+                (paths.local.as_ref(), false),
+                (paths.anchored.as_ref(), true),
+            ]
+        })
         .filter_map(|(path, anchored)| path.map(|path| (path, anchored)))
         .max_by_key(|(path, anchored)| {
             (
                 *anchored,
-                path.token_starts,
-                path.adjacent_steps,
+                path.initials,
+                path.adjacent,
                 std::cmp::Reverse(path.last - path.first),
                 std::cmp::Reverse(path.first),
             )
         })?;
 
-    let kind = if anchored {
+    // An anchored path can enter another token only through its initial.
+    let kind = if anchored && path.initials > 1 {
         AlignmentKind::Abbreviation {
-            crosses_token_boundary: token_starts.iter().any(|&boundary| {
-                usize::from(boundary) > path.first && usize::from(boundary) <= path.last
-            }),
-            initials_only: path.token_starts == query.len(),
+            initials_only: path.initials == query.len(),
         }
     } else {
         AlignmentKind::Subsequence

@@ -1,17 +1,12 @@
-mod alignment;
-mod matching;
-
 use std::cmp::Ordering;
 
-use matching::Rank;
 use rapidhash::RapidHashMap;
 
-use crate::config::Config;
 use crate::correction::CorrectionIndex;
 use crate::index::Index;
-use crate::model::{Entry, EntryId, FieldId};
-use crate::terms::Term;
+use crate::matching::Rank;
 use crate::text::NormalizedText;
+use crate::{Config, Entry, EntryId, FieldId};
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
@@ -61,72 +56,87 @@ impl Searcher {
             return Vec::new();
         }
 
-        let text = NormalizedText::new(input);
-        if text.is_empty() || text.len() > 512 {
+        let query = NormalizedText::new(input);
+        let query_len = query.chars.len();
+
+        if query_len == 0 || query_len > 512 {
             return Vec::new();
         }
 
-        let original = Term { text, cost: 0 };
-        let original_query_len = original.text.len();
         let mut best = RapidHashMap::default();
 
-        self.collect_matches(&original, original_query_len, &mut best);
+        self.collect_matches(&query, query_len, 0, &mut best);
 
         // Dictionary correction runs only when no accepted match has zero
         // edits.
-        let has_unedited_match = best.values().any(|(rank, _)| rank.details.edits == 0);
+        let has_unedited_match = best.values().any(|hit| hit.rank.edits == 0);
         if !has_unedited_match
             && let Some(corrector) = &self.corrector
-            && let Some((text, cost)) = corrector.correct(original.text.chars())
+            && let Some((text, edits)) = corrector.correct(&query.chars)
         {
-            let corrected = Term {
-                text: NormalizedText::new(text),
-                cost,
-            };
-            self.collect_matches(&corrected, original_query_len, &mut best);
+            let corrected = NormalizedText::new(text);
+            self.collect_matches(&corrected, query_len, edits, &mut best);
         }
 
         let mut results: Vec<_> = best.into_iter().collect();
-        results.sort_by(|(left_id, (left, _)), (right_id, (right, _))| {
-            left.tier
-                .cmp(&right.tier)
+        results.sort_by(|(left_id, left), (right_id, right)| {
+            left.rank
+                .tier
+                .cmp(&right.rank.tier)
                 .then_with(|| compare(*left_id, *right_id))
-                .then_with(|| left.details.cmp(&right.details))
+                .then_with(|| left.rank.cmp(&right.rank))
                 .then_with(|| left_id.cmp(right_id))
         });
         results.truncate(limit);
 
         results
             .into_iter()
-            .map(|(entry, (_, field))| SearchResult { entry, field })
+            .map(|(entry, hit)| SearchResult {
+                entry,
+                field: hit.field,
+            })
             .collect()
     }
 
     fn collect_matches(
         &self,
-        query: &Term,
+        query: &NormalizedText,
         original_query_len: usize,
-        best: &mut RapidHashMap<EntryId, (Rank, FieldId)>,
+        correction_edits: u16,
+        best: &mut RapidHashMap<EntryId, Hit>,
     ) {
-        let candidates = self
-            .index
-            .candidates(&query.text, self.config.max_candidates);
+        let candidates = self.index.candidates(query, self.config.max_candidates);
 
         for candidate in candidates {
-            let Some(rank) =
-                Rank::for_candidate(query, &candidate, original_query_len, &self.config)
-            else {
+            let Some(rank) = Rank::for_candidate(
+                &query.chars,
+                &candidate,
+                original_query_len,
+                correction_edits,
+                self.config.max_edits,
+            ) else {
                 continue;
             };
             let term = candidate.term;
 
-            let best = best.entry(term.entry).or_insert_with(|| (rank, term.field));
+            let best = best.entry(term.entry).or_insert(Hit {
+                rank,
+                field: term.field,
+            });
 
-            if rank < best.0 {
-                *best = (rank, term.field);
+            if rank < best.rank {
+                *best = Hit {
+                    rank,
+                    field: term.field,
+                };
             }
         }
     }
+}
+
+struct Hit {
+    rank: Rank,
+    field: FieldId,
 }
 
 #[cfg(test)]
