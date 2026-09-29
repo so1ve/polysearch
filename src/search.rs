@@ -41,10 +41,12 @@ impl Searcher {
         }
     }
 
-    /// Searches in three tiers: exact matches, completions, then fuzzy matches.
+    /// Orders results by field priority, then exact matches, completions,
+    /// and fuzzy matches.
     ///
-    /// Within each tier, `compare` takes precedence over built-in match
-    /// details. Return `Ordering::Equal` to use only the built-in ordering.
+    /// For the same priority and tier, `compare` takes precedence over built-in
+    /// match details. Return `Ordering::Equal` to use only the built-in
+    /// ordering.
     #[must_use]
     pub fn search(
         &self,
@@ -81,8 +83,9 @@ impl Searcher {
         let mut results: Vec<_> = best.into_iter().collect();
         results.sort_by(|(left_id, left), (right_id, right)| {
             left.rank
-                .tier
-                .cmp(&right.rank.tier)
+                .priority
+                .cmp(&right.rank.priority)
+                .then_with(|| left.rank.tier.cmp(&right.rank.tier))
                 .then_with(|| compare(*left_id, *right_id))
                 .then_with(|| left.rank.cmp(&right.rank))
                 .then_with(|| left_id.cmp(right_id))
@@ -147,7 +150,7 @@ mod tests {
     use crate::{ALIAS, Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn history_orders_each_tier_before_match_details() {
+    fn history_respects_field_priority_and_match_tier() {
         let searcher = Searcher::new(
             [
                 entry(1, vec![(1, PRIMARY_NAME, "GTK")]),
@@ -162,10 +165,9 @@ mod tests {
             Config::default(),
         );
 
-        assert_eq!(result_ids(&searcher, "gtk", 10), [1, 2, 3, 5, 4, 8, 6, 7]);
+        assert_eq!(result_ids(&searcher, "gtk", 10), [1, 3, 5, 8, 6, 7, 4, 2]);
 
-        // Strongest history favors the weakest tier. Within each tier it
-        // overrides field roles, prefix/substring distinctions and edit cost.
+        // History only reorders matches with the same priority and tier.
         let results = searcher.search("gtk", 10, |left, right| right.cmp(&left));
 
         assert_eq!(
@@ -173,11 +175,53 @@ mod tests {
                 .iter()
                 .map(|result| result.entry)
                 .collect::<Vec<_>>(),
-            [2, 1, 5, 4, 3, 8, 7, 6]
+            [1, 5, 3, 8, 7, 6, 4, 2]
         );
         assert_eq!(
             searcher.search("gtk", 1, |left, right| right.cmp(&left))[0].entry,
-            2
+            1
+        );
+    }
+
+    #[test]
+    fn title_prefix_outranks_exact_metadata_and_remains_the_best_field() {
+        let searcher = Searcher::new(
+            [
+                entry(
+                    1,
+                    vec![
+                        (1, PRIMARY_NAME, "ChatGPT Community"),
+                        (2, KEYWORD, "A chat client"),
+                    ],
+                ),
+                entry(
+                    2,
+                    vec![
+                        (3, PRIMARY_NAME, "Kelivo"),
+                        (4, KEYWORD, "A Flutter LLM chat client"),
+                    ],
+                ),
+                entry(
+                    3,
+                    vec![(5, PRIMARY_NAME, "Thunderbird"), (6, KEYWORD, "Email Chat")],
+                ),
+            ],
+            Config::default(),
+        );
+
+        // Favor Thunderbird and Kelivo in history; ChatGPT must still lead.
+        let results = searcher.search("chat", 3, |left, right| right.cmp(&left));
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.entry, result.field))
+                .collect::<Vec<_>>(),
+            [(1, 1), (3, 6), (2, 4)]
+        );
+        assert_eq!(
+            searcher.search("chat", 1, |left, right| right.cmp(&left))[0].entry,
+            1
         );
     }
 

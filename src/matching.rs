@@ -5,12 +5,12 @@ use alignment::{AlignmentKind, align};
 
 use crate::index::{Candidate, TokenMatch};
 
-// Field order supplies tie-breakers after the tier and caller preference.
+// Declaration order also determines an entry's best matching field.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Rank {
+    pub priority: u8,
     pub tier: Tier,
     pub edits: u16,
-    role: u8,
     kind: MatchKind,
     penalty: u16,
     gaps: u16,
@@ -106,9 +106,9 @@ impl Rank {
         };
 
         Some(Self {
+            priority: role.priority,
             tier,
             edits,
-            role: role.priority,
             kind,
             penalty: term.penalty,
             gaps: alignment.gaps,
@@ -143,7 +143,7 @@ mod tests {
     use crate::{Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn exact_matches_outrank_completions_and_subsequences() {
+    fn exact_names_outrank_name_completions_and_subsequences() {
         let searcher = Searcher::new(
             [
                 entry(1, vec![(1, PRIMARY_NAME, "DingTalk")]),
@@ -157,7 +157,7 @@ mod tests {
             Config::default(),
         );
 
-        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 4, 3, 1]);
+        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 3, 1, 4]);
     }
 
     #[test]
