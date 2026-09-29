@@ -1,5 +1,14 @@
+use std::cmp::Reverse;
+
 use super::subsequence;
-use crate::distance::{MatchLength, damerau_levenshtein};
+use crate::distance::{MatchMode, edit_distance};
+
+pub enum AlignmentKind {
+    Contiguous,
+    Subsequence,
+    Abbreviation { initials_only: bool },
+    Fuzzy,
+}
 
 pub struct Alignment {
     pub edits: u16,
@@ -7,13 +16,6 @@ pub struct Alignment {
     pub unmatched: u16,
     pub start: u16,
     pub kind: AlignmentKind,
-}
-
-pub enum AlignmentKind {
-    Contiguous,
-    Subsequence,
-    Abbreviation { initials_only: bool },
-    Fuzzy,
 }
 
 pub fn align(
@@ -50,17 +52,68 @@ pub fn align(
         return Some(contiguous);
     }
 
-    if let Some(alignment) = subsequence::align(query, candidate, token_starts) {
-        return Some(alignment);
+    subsequence::align(query, candidate, token_starts)
+        .or_else(|| fuzzy(query, candidate, token_starts, max_edits))
+}
+
+fn fuzzy(
+    query: &[char],
+    candidate: &[char],
+    token_starts: &[u16],
+    max_edits: u16,
+) -> Option<Alignment> {
+    let max_edits = max_edits.min((query.len() / 3) as u16);
+
+    if max_edits == 0 {
+        return None;
     }
 
-    let (edits, end) = damerau_levenshtein(query, candidate, max_edits, MatchLength::Prefix)?;
+    // Prefer word prefixes, including ones that continue into later words.
+    let mut best = token_starts
+        .iter()
+        .filter_map(|&start| {
+            let start = usize::from(start);
+            let (edits, span) =
+                edit_distance(query, &candidate[start..], max_edits, MatchMode::Prefix)?;
 
-    Some(Alignment {
+            Some((edits, Reverse(span.len()), start))
+        })
+        .min();
+
+    // Exact matches were handled above. An internal fragment can only beat
+    // a word prefix by using fewer edits, so a one-edit prefix is enough.
+    let max_edits = best.map(|(edits, ..)| edits - 1).unwrap_or(max_edits);
+
+    if max_edits > 0 {
+        for (token, &start) in token_starts.iter().enumerate() {
+            let start = usize::from(start);
+            let end = token_starts
+                .get(token + 1)
+                .map(|&end| usize::from(end))
+                .unwrap_or(candidate.len());
+
+            // Internal fragments stay within a word; they must not stitch
+            // unrelated words together, such as `amd` in `Program Loader`.
+            if let Some((edits, span)) = edit_distance(
+                query,
+                &candidate[start..end],
+                max_edits,
+                MatchMode::Substring,
+            ) {
+                let matched = (edits, Reverse(span.len()), start + span.start);
+
+                if best.is_none_or(|previous| matched < previous) {
+                    best = Some(matched);
+                }
+            }
+        }
+    }
+
+    best.map(|(edits, Reverse(consumed), start)| Alignment {
         edits,
         gaps: 0,
-        unmatched: (candidate.len() - end) as u16,
-        start: 0,
+        unmatched: (candidate.len() - consumed) as u16,
+        start: start as u16,
         kind: AlignmentKind::Fuzzy,
     })
 }

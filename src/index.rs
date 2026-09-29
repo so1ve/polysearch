@@ -106,7 +106,7 @@ impl Index {
                 self.bigrams.entry(bigram).or_default().push(id);
             }
 
-            if term.penalty == 0 {
+            if field.role.allow_substring {
                 for pair in near_pairs(&chars) {
                     let postings = self.near_pairs.entry(pair).or_default();
 

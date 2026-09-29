@@ -6,7 +6,7 @@ use string_interner::backend::StringBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::{StringInterner, Symbol};
 
-use crate::distance::{MatchLength, damerau_levenshtein};
+use crate::distance::{MatchMode, edit_distance};
 
 const MAX_INDEXED_EDITS: u16 = 2;
 const DELETE_PREFIX_LENGTH: usize = 7;
@@ -66,8 +66,7 @@ impl CorrectionIndex {
         let mut best_cost = u16::MAX;
         let mut consider = |symbol, term: &str| {
             let chars: Vec<_> = term.chars().collect();
-            let Some((cost, _)) =
-                damerau_levenshtein(query, &chars, self.max_edits, MatchLength::Full)
+            let Some((cost, _)) = edit_distance(query, &chars, self.max_edits, MatchMode::Full)
             else {
                 return;
             };

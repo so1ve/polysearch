@@ -5,6 +5,22 @@ use alignment::{AlignmentKind, align};
 
 use crate::index::{Candidate, TokenMatch};
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Tier {
+    Exact,
+    Completion,
+    Fuzzy,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum MatchKind {
+    Exact,
+    Prefix,
+    Abbreviation,
+    Substring,
+    Subsequence,
+}
+
 // Declaration order also determines an entry's best matching field.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Rank {
@@ -46,12 +62,12 @@ impl Rank {
             }
         }
 
-        let alignment = align(
-            query,
-            &term.chars,
-            &term.token_starts,
-            max_edits - correction_edits,
-        )?;
+        let fuzzy_edits = if role.allow_substring {
+            max_edits - correction_edits
+        } else {
+            0
+        };
+        let alignment = align(query, &term.chars, &term.token_starts, fuzzy_edits)?;
 
         let kind = match alignment.kind {
             AlignmentKind::Contiguous => {
@@ -80,11 +96,11 @@ impl Rank {
                 MatchKind::Subsequence
             }
             AlignmentKind::Fuzzy => {
-                if !role.allow_substring {
-                    return None;
+                if term.token_starts.contains(&alignment.start) {
+                    MatchKind::Prefix
+                } else {
+                    MatchKind::Substring
                 }
-
-                MatchKind::Prefix
             }
         };
 
@@ -117,22 +133,6 @@ impl Rank {
             frequency: term.frequency.min(u32::from(u16::MAX)) as u16,
         })
     }
-}
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Tier {
-    Exact,
-    Completion,
-    Fuzzy,
-}
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum MatchKind {
-    Exact,
-    Prefix,
-    Abbreviation,
-    Substring,
-    Subsequence,
 }
 
 #[cfg(test)]
