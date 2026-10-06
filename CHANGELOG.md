@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/so1ve/polysearch/compare/v0.3.2...v0.4.0) - 2026-10-06
+
+### Added
+
+- use `frizbee` for fuzzy matching and better performance
+
+### Other
+
+- *(deps)* update rust crate smallvec to v1.16.2 ([#5](https://github.com/so1ve/polysearch/pull/5))
+
 ## [0.3.2](https://github.com/so1ve/polysearch/compare/v0.3.1...v0.3.2) - 2026-09-29
 
 ### Fixed
