@@ -1,278 +1,137 @@
-mod alignment;
-mod subsequence;
+use frizbee::{CaseMatching, Config as MatcherConfig, Matcher, Pattern, SortStrategy};
 
-use alignment::{AlignmentKind, align};
+use crate::index::{Kind, Source, Spelling};
+use crate::{ALIAS, Config, IDENTIFIER, KEYWORD, LOCALIZED_NAME, PRIMARY_NAME};
 
-use crate::index::{Candidate, TokenMatch};
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Tier {
-    Exact,
-    Completion,
-    Fuzzy,
-}
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum MatchKind {
-    Exact,
-    Prefix,
-    Abbreviation,
-    Substring,
-    Subsequence,
-}
-
-// Declaration order also determines an entry's best matching field.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Rank {
-    pub priority: u8,
-    pub tier: Tier,
-    pub edits: u16,
-    kind: MatchKind,
-    penalty: u16,
-    gaps: u16,
-    unmatched: u16,
-    start: u16,
-    frequency: u16,
+    exact_name: bool,
+    pub score: i32,
 }
 
-impl Rank {
-    pub fn for_candidate(
-        query: &[char],
-        candidate: &Candidate<'_>,
-        original_query_len: usize,
-        correction_edits: u16,
-        max_edits: u16,
-    ) -> Option<Self> {
-        let term = candidate.term;
-        let role = term.role;
+struct Scores {
+    text: i32,
+    name: i32,
+    #[cfg(feature = "pinyin")]
+    initials: i32,
+    exact: bool,
+}
 
-        if original_query_len.min(query.len()) < usize::from(role.min_query_chars) {
-            return None;
-        }
-
-        // A corrected query must match a whole term or token; a guessed word
-        // must not introduce new prefix completions.
-        if correction_edits > 0 {
-            if !role.allow_correction {
-                return None;
-            }
-
-            if term.chars.as_ref() != query && candidate.token != Some(TokenMatch::Exact) {
-                return None;
-            }
-        }
-
-        let fuzzy_edits = if role.allow_substring {
-            max_edits - correction_edits
-        } else {
-            0
+impl Scores {
+    fn rank(&self, source: &Source) -> Rank {
+        let score = match source.kind {
+            Kind::Literal if source.role <= ALIAS => self.name,
+            Kind::Literal => self.text,
+            #[cfg(feature = "pinyin")]
+            Kind::Pinyin => self.text - 40,
+            #[cfg(feature = "pinyin")]
+            Kind::Initials => self.initials - 80,
         };
-        let alignment = align(query, &term.chars, &term.token_starts, fuzzy_edits)?;
-
-        let kind = match alignment.kind {
-            AlignmentKind::Contiguous => {
-                if alignment.start == 0 || candidate.token.is_some() {
-                    MatchKind::Prefix
-                } else if role.allow_substring {
-                    MatchKind::Substring
-                } else {
-                    return None;
-                }
-            }
-            AlignmentKind::Abbreviation { initials_only } => {
-                if !role.allow_substring || (original_query_len < 3 && !initials_only) {
-                    return None;
-                }
-
-                MatchKind::Abbreviation
-            }
-            AlignmentKind::Subsequence => {
-                if !role.allow_substring
-                    || (original_query_len < 3 && (alignment.start > 0 || alignment.gaps > 1))
-                {
-                    return None;
-                }
-
-                MatchKind::Subsequence
-            }
-            AlignmentKind::Fuzzy => {
-                if term.token_starts.contains(&alignment.start) {
-                    MatchKind::Prefix
-                } else {
-                    MatchKind::Substring
-                }
-            }
+        let field_bonus = match source.role {
+            PRIMARY_NAME => 160,
+            LOCALIZED_NAME => 120,
+            ALIAS => 80,
+            KEYWORD => 0,
+            IDENTIFIER => -40,
+            _ => unreachable!(),
         };
 
-        let kind = if candidate.token == Some(TokenMatch::Exact)
-            || (alignment.gaps == 0 && alignment.unmatched == 0)
+        Rank {
+            exact_name: self.exact && source.kind == Kind::Literal && source.role <= ALIAS,
+            score: score + field_bonus,
+        }
+    }
+}
+
+pub fn matches<'a>(
+    query: &'a str,
+    spellings: &'a [Spelling],
+    config: &Config,
+) -> impl Iterator<Item = (&'a Source, Rank)> {
+    let mut settings = MatcherConfig {
+        max_typos: Some(config.max_typos),
+        casing: CaseMatching::Ignore,
+        sort: SortStrategy::IndexAsc,
+        ..MatcherConfig::default()
+    };
+    settings.scoring.matching_case_bonus = 0;
+    settings.scoring.exact_match_bonus = 0;
+
+    // Construct literal patterns: punctuation is input, not Frizbee query
+    // syntax.
+    let patterns: Vec<Pattern> = query.split_whitespace().map(Pattern::from).collect();
+    let query_chars: usize = patterns
+        .iter()
+        .map(|pattern| pattern.needle.chars().count())
+        .sum();
+    let completion_score = query_chars * usize::from(settings.scoring.match_score)
+        + patterns.len() * usize::from(settings.scoring.prefix_bonus);
+    let mut matcher = Matcher::from_patterns(&patterns, &settings);
+    let hits = matcher.match_list(spellings);
+    let compact = query.replace(' ', "");
+
+    hits.into_iter().flat_map(move |hit| {
+        let spelling = &spellings[hit.index as usize];
+        let text = spelling.text.as_ref();
+        let score_text = |text: &str, score: u16| {
+            // A perfect completion is worth 1000 before coverage bonuses.
+            let mut quality = (usize::from(score) * 1_000 / completion_score) as i32;
+            let contiguous = patterns
+                .iter()
+                .all(|pattern| text.contains(&pattern.needle));
+            let mut initials = text
+                .split_whitespace()
+                .map(|word| word.chars().next().unwrap());
+            let abbreviation = compact
+                .chars()
+                .all(|ch| initials.by_ref().any(|initial| initial == ch));
+
+            // Keep substrings and word initials strong away from the start.
+            if contiguous || abbreviation {
+                quality = quality.max(950) + 150;
+            }
+
+            let chars = text.chars().filter(|&ch| ch != ' ').count();
+            let coverage = (300 * query_chars.min(chars) / chars) as i32;
+
+            (quality, coverage)
+        };
+        let (quality, coverage) = score_text(text, hit.score);
+        let text_score = quality + coverage;
+        let mut name_score = text_score;
+
+        // Score name components such as Writer in LibreOffice Writer, using
+        // the same matcher. Sentence fragments in descriptions get no bonus.
+        if text.contains(' ')
+            && spelling
+                .sources
+                .iter()
+                .any(|source| source.role <= ALIAS && source.kind == Kind::Literal)
         {
-            MatchKind::Exact
-        } else {
-            kind
-        };
+            for word in text.split_whitespace() {
+                let Some(word_match) = matcher.match_one(word, 0) else {
+                    continue;
+                };
+                let (quality, coverage) = score_text(word, word_match.score);
 
-        let edits = correction_edits + alignment.edits;
-        let tier = if edits > 0 || kind == MatchKind::Subsequence {
-            Tier::Fuzzy
-        } else if kind == MatchKind::Exact {
-            Tier::Exact
-        } else {
-            Tier::Completion
-        };
-
-        Some(Self {
-            priority: role.priority,
-            tier,
-            edits,
-            kind,
-            penalty: term.penalty,
-            gaps: alignment.gaps,
-            unmatched: alignment.unmatched,
-            start: alignment.start,
-            frequency: term.frequency.min(u32::from(u16::MAX)) as u16,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cmp::Ordering;
-
-    use crate::test_support::{entries, entry, result_ids};
-    use crate::{Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
-
-    #[test]
-    fn exact_names_outrank_name_completions_and_subsequences() {
-        let searcher = Searcher::new(
-            [
-                entry(1, vec![(1, PRIMARY_NAME, "DingTalk")]),
-                entry(2, vec![(2, PRIMARY_NAME, "GTK Demo")]),
-                entry(3, vec![(3, PRIMARY_NAME, "GTKraken")]),
-                entry(
-                    4,
-                    vec![(4, KEYWORD, "A simple editor demonstrating GTK printing")],
-                ),
-            ],
-            Config::default(),
-        );
-
-        assert_eq!(result_ids(&searcher, "gtk", 10), [2, 3, 1, 4]);
-    }
-
-    #[test]
-    fn identifier_tokens_are_accepted_but_inside_token_substrings_are_rejected() {
-        let searcher = Searcher::new(
-            [
-                entry(1, vec![(1, IDENTIFIER, "org.gnome.Nautilus")]),
-                entry(2, vec![(2, IDENTIFIER, "xfoo foo")]),
-            ],
-            Config {
-                enable_correction: false,
-                ..Config::default()
-            },
-        );
-
-        assert_eq!(result_ids(&searcher, "nautilus", 5), [1]);
-        assert!(
-            searcher
-                .search("autilus", 5, |_, _| Ordering::Equal)
-                .is_empty()
-        );
-        assert_eq!(result_ids(&searcher, "foo", 5), [2]);
-    }
-
-    #[test]
-    fn names_rank_by_full_length_before_identifiers() {
-        let searcher = Searcher::new(
-            [
-                entry(1, vec![(1, PRIMARY_NAME, "Code Editor")]),
-                entry(2, vec![(2, IDENTIFIER, "editor")]),
-                entry(3, vec![(3, PRIMARY_NAME, "Editor")]),
-            ],
-            Config::default(),
-        );
-
-        assert_eq!(result_ids(&searcher, "editor", 5), [3, 1, 2]);
-        assert_eq!(result_ids(&searcher, "e", 5), [3, 1]);
-    }
-
-    #[test]
-    fn fuzzy_prefixes_keep_exact_matches_first_and_respect_edit_limits() {
-        for (max_edits, expected) in [(0, vec![]), (1, vec![2]), (2, vec![2, 1])] {
-            let searcher = Searcher::new(
-                entries(&["algermusicplayer", "algormusicplayer"]),
-                Config {
-                    enable_correction: false,
-                    max_edits,
-                    ..Config::default()
-                },
-            );
-
-            assert_eq!(
-                searcher.search("algormusic", 5, |_, _| Ordering::Equal)[0].entry,
-                2
-            );
-            assert_eq!(
-                result_ids(&searcher, "algormusix", 5),
-                expected,
-                "max_edits={max_edits}"
-            );
+                // The complete name wins over an equally good component.
+                name_score = name_score.max(quality + coverage - 100);
+            }
         }
-    }
 
-    #[test]
-    fn complete_typo_matches_rank_before_equivalent_prefix_completions() {
-        let searcher = Searcher::new(entries(&["amdbuild", "amdbase", "amdb"]), Config::default());
+        let exact = text == query || text == compact;
+        let scores = Scores {
+            text: text_score,
+            name: name_score,
+            // Initials already compress the name, so omit coverage bonuses.
+            #[cfg(feature = "pinyin")]
+            initials: quality + i32::from(exact) * 100,
+            exact,
+        };
 
-        assert_eq!(result_ids(&searcher, "amdm", 5), [3, 2, 1]);
-    }
-
-    #[test]
-    fn spelling_quality_ranks_before_name_frequency() {
-        let searcher = Searcher::new(
-            entries(&["algermusicplayer", "algomusicplayer", "algomusicplayer"]),
-            Config::default(),
-        );
-
-        assert_eq!(result_ids(&searcher, "algo", 5), [2, 3, 1]);
-    }
-
-    #[test]
-    fn fuzzy_ranking_uses_the_consumed_prefix_length() {
-        let searcher = Searcher::new(
-            entries(&["abcefg", "abcyef", "abcef"]),
-            Config {
-                enable_correction: false,
-                ..Config::default()
-            },
-        );
-
-        assert_eq!(result_ids(&searcher, "abcxef", 5), [2, 3, 1]);
-    }
-
-    #[test]
-    fn corrections_do_not_use_broad_keyword_fields() {
-        let searcher = Searcher::new(
-            [entry(
-                1,
-                vec![
-                    (1, PRIMARY_NAME, "KDE Connect SMS"),
-                    (2, KEYWORD, "Read and send SMS messages"),
-                ],
-            )],
-            Config::default(),
-        );
-
-        assert!(searcher.search("amd", 5, |_, _| Ordering::Equal).is_empty());
-    }
-
-    #[test]
-    fn short_substrings_and_near_pairs_do_not_allow_arbitrary_subsequences() {
-        let searcher = Searcher::new(entries(&["zed", "oopz"]), Config::default());
-
-        assert_eq!(result_ids(&searcher, "zd", 5), [1]);
-        assert_eq!(result_ids(&searcher, "op", 5), [2]);
-        assert!(searcher.search("oz", 5, |_, _| Ordering::Equal).is_empty());
-    }
+        spelling
+            .sources
+            .iter()
+            .map(move |source| (source, scores.rank(source)))
+    })
 }

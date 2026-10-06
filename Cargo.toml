@@ -40,8 +40,7 @@ verbose_file_reads = "warn"
 wildcard_imports = "warn"
 
 [dependencies]
-arrayvec = "0.7.8"
+frizbee = "0.13"
 pinyin_pro = { version = "3.29.4", optional = true }
 rapidhash = "4.5.1"
 smallvec = "1.15.1"
-string-interner = { version = "0.20.0", default-features = false, features = ["backends", "inline-more", "std"] }

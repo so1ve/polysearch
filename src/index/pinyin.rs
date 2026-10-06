@@ -5,13 +5,11 @@ use pinyin_pro::options::{
 use pinyin_pro::pinyin::pinyin;
 use pinyin_pro::pinyin_utils::strip_tone;
 
-const FULL_PINYIN_PENALTY: u16 = 18;
-const INITIALS_PENALTY: u16 = 28;
-const ALTERNATIVE_PINYIN_PENALTY: u16 = 22;
-const ALTERNATIVE_INITIALS_PENALTY: u16 = 32;
+use super::Kind;
+
 const MAX_READINGS: usize = 8;
 
-pub fn expand(input: &str, mut emit: impl FnMut(&str, u16)) {
+pub fn expand(input: &str, mut emit: impl FnMut(&str, Kind)) {
     if !input.chars().any(is_han) {
         return;
     }
@@ -34,25 +32,24 @@ pub fn expand(input: &str, mut emit: impl FnMut(&str, u16)) {
         value
     };
 
-    emit(&read(PatternKind::Pinyin), FULL_PINYIN_PENALTY);
+    emit(&read(PatternKind::Pinyin), Kind::Pinyin);
 
     let alternatives = AlternativeReadings::new(input);
 
     for reading in alternatives.full {
-        emit(&reading, ALTERNATIVE_PINYIN_PENALTY);
+        emit(&reading, Kind::Pinyin);
     }
 
-    emit(&read(PatternKind::First), INITIALS_PENALTY);
+    emit(&read(PatternKind::First), Kind::Initials);
 
     for reading in alternatives.initials {
-        emit(&reading, ALTERNATIVE_INITIALS_PENALTY);
+        emit(&reading, Kind::Initials);
     }
 }
 
 struct AlternativeReadings {
     full: Vec<String>,
     initials: Vec<String>,
-    previous_han: bool,
 }
 
 impl AlternativeReadings {
@@ -60,73 +57,56 @@ impl AlternativeReadings {
         let mut readings = Self {
             full: vec![String::new()],
             initials: vec![String::new()],
-            previous_han: false,
         };
 
         for ch in input.chars() {
-            readings.push(ch);
+            if !is_han(ch) {
+                for value in readings.full.iter_mut().chain(&mut readings.initials) {
+                    value.push(ch);
+                }
+
+                continue;
+            }
+
+            let mut options: Vec<_> = get_all_pinyin(&ch.to_string(), SurnameMode::Off)
+                .into_iter()
+                .map(|reading| strip_tone(&reading).replace('ü', "v"))
+                .collect();
+            options.sort();
+            options.dedup();
+
+            if options.is_empty() {
+                options.push(ch.to_string());
+            }
+
+            let mut initials: Vec<String> = options
+                .iter()
+                .map(|reading| reading.chars().take(1).collect())
+                .collect();
+            initials.dedup();
+
+            // Pinyin spellings are indexed without spaces.
+            for (variants, options) in [
+                (&mut readings.full, &options),
+                (&mut readings.initials, &initials),
+            ] {
+                *variants = variants
+                    .iter()
+                    .flat_map(|prefix| {
+                        options.iter().map(move |option| {
+                            let mut value = String::with_capacity(prefix.len() + option.len());
+                            value.push_str(prefix);
+                            value.push_str(option);
+
+                            value
+                        })
+                    })
+                    .take(MAX_READINGS - 1)
+                    .collect();
+            }
         }
 
         readings
-    }
-
-    fn push(&mut self, ch: char) {
-        let han = is_han(ch);
-        let mut options = if han {
-            get_all_pinyin(&ch.to_string(), SurnameMode::Off)
-                .into_iter()
-                .map(|reading| strip_tone(&reading).replace('ü', "v"))
-                .collect::<Vec<_>>()
-        } else {
-            vec![ch.to_string()]
-        };
-
-        options.sort();
-        options.dedup();
-
-        if options.is_empty() {
-            options.push(ch.to_string());
-        }
-
-        let mut initials = if han {
-            options
-                .iter()
-                .map(|reading| reading.chars().take(1).collect())
-                .collect::<Vec<String>>()
-        } else {
-            options.clone()
-        };
-        initials.sort();
-        initials.dedup();
-
-        for (variants, options) in [(&mut self.full, &options), (&mut self.initials, &initials)] {
-            let mut next = Vec::new();
-
-            'variants: for prefix in variants.iter() {
-                for option in options {
-                    let mut value = String::with_capacity(prefix.len() + option.len() + 1);
-                    value.push_str(prefix);
-
-                    if !prefix.is_empty() && (self.previous_han || han) {
-                        value.push(' ');
-                    }
-
-                    value.push_str(option);
-
-                    if !next.contains(&value) {
-                        next.push(value);
-                    }
-
-                    if next.len() >= MAX_READINGS - 1 {
-                        break 'variants;
-                    }
-                }
-            }
-
-            *variants = next;
-        }
-
-        self.previous_han = han;
     }
 }
 
@@ -142,62 +122,46 @@ const fn is_han(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{entries, result_ids};
-    use crate::{Config, Searcher};
+    use crate::test_support::{entries, entry, result_ids};
+    use crate::{Config, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn pinyin_uses_the_same_tiers_as_literal_text() {
+    fn literal_names_and_full_readings_outrank_lossy_initials() {
         let searcher = Searcher::new(
             entries(&["bj", "笔记", "bjtool", "bijitool"]),
             Config::default(),
         );
 
-        assert_eq!(result_ids(&searcher, "bj", 10), [1, 2, 3, 4]);
-
-        let results = searcher.search("bj", 10, |left, right| right.cmp(&left));
-
+        assert_eq!(result_ids(&searcher, "bj", 10), [1, 3, 2, 4]);
         assert_eq!(
-            results
-                .iter()
-                .map(|result| result.entry)
-                .collect::<Vec<_>>(),
-            [2, 1, 3, 4]
-        );
-        assert_eq!(
-            searcher.search("biji", 1, |left, right| right.cmp(&left))[0].entry,
+            searcher.search("biji", 1, |id| if id == 4 { 255 } else { 0 })[0].entry,
             2
         );
     }
 
     #[test]
-    fn alternative_readings_are_searchable() {
+    fn full_pinyin_keywords_outrank_fuzzy_names() {
         let searcher = Searcher::new(
-            entries(&["银行"]),
-            Config {
-                max_edits: 0,
-                enable_correction: false,
-                ..Config::default()
-            },
+            [
+                entry(
+                    1,
+                    vec![(1, PRIMARY_NAME, "thinking face"), (2, KEYWORD, "思考")],
+                ),
+                entry(2, vec![(3, PRIMARY_NAME, "司空")]),
+                entry(3, vec![(4, PRIMARY_NAME, "石刻")]),
+            ],
+            Config::default(),
         );
 
-        for query in ["yinhang", "yinxing"] {
-            assert_eq!(result_ids(&searcher, query, 5), [1], "query={query}");
-        }
+        assert_eq!(result_ids(&searcher, "sikao", 1), [1]);
     }
 
     #[test]
-    fn mixed_names_preserve_non_chinese_content() {
-        let searcher = Searcher::new(
-            entries(&["文档助手 Beta"]),
-            Config {
-                max_edits: 0,
-                enable_correction: false,
-                ..Config::default()
-            },
-        );
+    fn initials_support_typos_and_skipped_characters() {
+        let searcher = Searcher::new(entries(&["文件资源管理器"]), Config::default());
 
-        for query in ["wendangzhushoubeta", "wdzsbeta"] {
-            assert_eq!(result_ids(&searcher, query, 5), [1], "query={query}");
+        for query in ["wjzyglq", "wjzyglx", "wzglq"] {
+            assert_eq!(result_ids(&searcher, query, 1), [1], "query={query}");
         }
     }
 }

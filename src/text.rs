@@ -1,39 +1,34 @@
-pub struct NormalizedText {
-    pub text: String,
-    pub chars: Vec<char>,
-}
+pub fn normalize(input: &str) -> String {
+    let mut text = String::with_capacity(input.len());
+    let mut space = false;
+    let mut previous = None;
+    let mut chars = input.chars().peekable();
 
-impl NormalizedText {
-    pub fn new(input: &str) -> Self {
-        let mut text = String::with_capacity(input.len());
-        let mut chars = Vec::new();
-        let mut pending_space = false;
-
-        for character in input.chars() {
-            if character.is_whitespace() || matches!(character, '/' | '\\' | '_' | '-' | '.' | '·')
-            {
-                if !text.is_empty() {
-                    pending_space = true;
-                }
-
-                continue;
-            }
-
-            if pending_space {
-                text.push(' ');
-                pending_space = false;
-            }
-
-            for lower in character.to_lowercase() {
-                text.push(lower);
-                chars.push(lower);
-            }
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() || matches!(ch, '/' | '\\' | '_' | '-' | '.' | '·') {
+            space = !text.is_empty();
+            previous = None;
+            continue;
         }
 
-        Self { text, chars }
+        // Preserve word boundaries before folding case: AutoSlides, ChatGPT.
+        if ch.is_uppercase()
+            && previous.is_some_and(|prev: char| {
+                prev.is_lowercase()
+                    || (prev.is_uppercase() && chars.peek().is_some_and(|next| next.is_lowercase()))
+            })
+        {
+            space = true;
+        }
+
+        if space {
+            text.push(' ');
+            space = false;
+        }
+
+        text.extend(ch.to_lowercase());
+        previous = Some(ch);
     }
 
-    pub fn match_key(&self) -> String {
-        self.chars.iter().collect()
-    }
+    text
 }

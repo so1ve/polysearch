@@ -1,12 +1,8 @@
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 
-use rapidhash::RapidHashMap;
-
-use crate::correction::CorrectionIndex;
 use crate::index::Index;
-use crate::matching::Rank;
-use crate::text::NormalizedText;
-use crate::{Config, Entry, EntryId, FieldId};
+use crate::text::normalize;
+use crate::{Config, Entry, EntryId, FieldId, matching};
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
@@ -16,170 +12,111 @@ pub struct SearchResult {
 
 pub struct Searcher {
     index: Index,
-    corrector: Option<CorrectionIndex>,
     config: Config,
 }
 
 impl Searcher {
-    /// Builds an index with token matching and bounded edit correction.
+    /// Prepares shared text variants for Frizbee matching.
     ///
     /// # Panics
     ///
-    /// Panics if entry IDs or field IDs are duplicated, or if more than 2^32
-    /// indexed terms are generated. Field IDs are unique across the entire
-    /// index, including fields belonging to different entries.
+    /// Panics if entry IDs or field IDs are duplicated. Field IDs must be
+    /// unique across the entire index, including fields belonging to
+    /// different entries.
     #[must_use]
     pub fn new(entries: impl IntoIterator<Item = Entry>, config: Config) -> Self {
-        let index = Index::new(entries);
-        let corrector = (config.enable_correction && config.max_edits > 0)
-            .then(|| CorrectionIndex::new(&index.vocabulary(), config.max_edits));
-
         Self {
-            index,
-            corrector,
+            index: Index::new(entries),
             config,
         }
     }
 
-    /// Orders results by field priority, then exact matches, completions,
-    /// and fuzzy matches.
+    /// Ranks exact names and aliases first, then matches by quality, field,
+    /// and spelling confidence.
     ///
-    /// For the same priority and tier, `compare` takes precedence over built-in
-    /// match details. Return `Ordering::Equal` to use only the built-in
-    /// ordering.
+    /// `preference` returns 0–255 for each matching entry, adding up to 50
+    /// points to a score where a perfect completion is worth 1000. Return
+    /// zero for built-in ordering alone. The callback runs once per
+    /// matching entry.
     #[must_use]
     pub fn search(
         &self,
         input: &str,
         limit: usize,
-        mut compare: impl FnMut(EntryId, EntryId) -> Ordering,
+        mut preference: impl FnMut(EntryId) -> u8,
     ) -> Vec<SearchResult> {
-        if limit == 0 || self.config.max_candidates == 0 {
+        if limit == 0 {
             return Vec::new();
         }
 
-        let query = NormalizedText::new(input);
-        let query_len = query.chars.len();
+        let query = normalize(input);
 
-        if query_len == 0 || query_len > 512 {
+        if query.is_empty() {
             return Vec::new();
         }
 
-        let mut best = RapidHashMap::default();
+        let mut best = vec![None; self.index.entries.len()];
 
-        self.collect_matches(&query, query_len, 0, &mut best);
+        for (source, rank) in matching::matches(&query, &self.index.spellings, &self.config) {
+            let candidate = (rank, Reverse(source.field));
 
-        // Dictionary correction runs only when no accepted match has zero
-        // edits.
-        let has_unedited_match = best.values().any(|hit| hit.rank.edits == 0);
-        if !has_unedited_match
-            && let Some(corrector) = &self.corrector
-            && let Some((text, edits)) = corrector.correct(&query.chars)
-        {
-            let corrected = NormalizedText::new(text);
-            self.collect_matches(&corrected, query_len, edits, &mut best);
+            if best[source.entry].is_none_or(|previous| candidate > previous) {
+                best[source.entry] = Some(candidate);
+            }
         }
 
-        let mut results: Vec<_> = best.into_iter().collect();
-        results.sort_by(|(left_id, left), (right_id, right)| {
-            left.rank
-                .priority
-                .cmp(&right.rank.priority)
-                .then_with(|| left.rank.tier.cmp(&right.rank.tier))
-                .then_with(|| compare(*left_id, *right_id))
-                .then_with(|| left.rank.cmp(&right.rank))
-                .then_with(|| left_id.cmp(right_id))
-        });
+        let mut results: Vec<_> = best
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, hit)| {
+                hit.map(|(mut rank, Reverse(field))| {
+                    let entry = self.index.entries[index];
+                    rank.score += i32::from(preference(entry)) * 50 / 255;
+
+                    (Reverse(rank), entry, field)
+                })
+            })
+            .collect();
+
+        results.sort_unstable();
         results.truncate(limit);
 
         results
             .into_iter()
-            .map(|(entry, hit)| SearchResult {
-                entry,
-                field: hit.field,
-            })
+            .map(|(_, entry, field)| SearchResult { entry, field })
             .collect()
     }
-
-    fn collect_matches(
-        &self,
-        query: &NormalizedText,
-        original_query_len: usize,
-        correction_edits: u16,
-        best: &mut RapidHashMap<EntryId, Hit>,
-    ) {
-        let candidates = self.index.candidates(query, self.config.max_candidates);
-
-        for candidate in candidates {
-            let Some(rank) = Rank::for_candidate(
-                &query.chars,
-                &candidate,
-                original_query_len,
-                correction_edits,
-                self.config.max_edits,
-            ) else {
-                continue;
-            };
-            let term = candidate.term;
-
-            let best = best.entry(term.entry).or_insert(Hit {
-                rank,
-                field: term.field,
-            });
-
-            if rank < best.rank {
-                *best = Hit {
-                    rank,
-                    field: term.field,
-                };
-            }
-        }
-    }
-}
-
-struct Hit {
-    rank: Rank,
-    field: FieldId,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
+    use frizbee::{CaseMatching, Config as MatcherConfig, Matcher};
 
     use crate::test_support::{entries, entry, result_ids};
     use crate::{ALIAS, Config, IDENTIFIER, KEYWORD, PRIMARY_NAME, Searcher};
 
     #[test]
-    fn history_respects_field_priority_and_match_tier() {
+    fn strong_metadata_matches_outrank_weak_names_even_with_history() {
         let searcher = Searcher::new(
             [
-                entry(1, vec![(1, PRIMARY_NAME, "GTK")]),
-                entry(2, vec![(2, KEYWORD, "GTK Demo")]),
-                entry(3, vec![(3, PRIMARY_NAME, "GTKraken")]),
-                entry(4, vec![(4, ALIAS, "Xgtkview")]),
-                entry(5, vec![(5, PRIMARY_NAME, "General Toolkit")]),
-                entry(6, vec![(6, PRIMARY_NAME, "DingTalk")]),
-                entry(7, vec![(7, PRIMARY_NAME, "GTL")]),
-                entry(8, vec![(8, PRIMARY_NAME, "GetKit Tools")]),
+                entry(1, vec![(1, PRIMARY_NAME, "GTK Demo")]),
+                entry(2, vec![(2, PRIMARY_NAME, "GTKraken")]),
+                entry(3, vec![(3, PRIMARY_NAME, "DingTalk")]),
+                entry(
+                    4,
+                    vec![(4, KEYWORD, "An editor demonstrating GTK printing")],
+                ),
             ],
             Config::default(),
         );
-
-        assert_eq!(result_ids(&searcher, "gtk", 10), [1, 3, 5, 8, 6, 7, 4, 2]);
-
-        // History only reorders matches with the same priority and tier.
-        let results = searcher.search("gtk", 10, |left, right| right.cmp(&left));
+        let results = searcher.search("gtk", 10, |id| if id == 3 { 255 } else { 0 });
 
         assert_eq!(
             results
                 .iter()
                 .map(|result| result.entry)
                 .collect::<Vec<_>>(),
-            [1, 5, 3, 8, 7, 6, 4, 2]
-        );
-        assert_eq!(
-            searcher.search("gtk", 1, |left, right| right.cmp(&left))[0].entry,
-            1
+            [1, 2, 4, 3]
         );
     }
 
@@ -208,9 +145,7 @@ mod tests {
             ],
             Config::default(),
         );
-
-        // Favor Thunderbird and Kelivo in history; ChatGPT must still lead.
-        let results = searcher.search("chat", 3, |left, right| right.cmp(&left));
+        let results = searcher.search("chat", 3, |id| if id == 3 { 255 } else { 0 });
 
         assert_eq!(
             results
@@ -219,71 +154,162 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, 1), (3, 6), (2, 4)]
         );
-        assert_eq!(
-            searcher.search("chat", 1, |left, right| right.cmp(&left))[0].entry,
-            1
-        );
     }
 
     #[test]
-    fn correction_and_direct_alignment_use_the_same_edit_cost() {
-        let searcher = Searcher::new(entries(&["woixon", "Messenger Weixni"]), Config::default());
-
-        assert_eq!(result_ids(&searcher, "weixin", 5), [2, 1]);
-    }
-
-    #[test]
-    fn corrections_do_not_expand_an_exact_result() {
+    fn shared_spellings_keep_unique_results_and_the_best_field() {
         let searcher = Searcher::new(
             [
-                entry(1, vec![(1, IDENTIFIER, "weixni")]),
-                entry(2, vec![(2, IDENTIFIER, "weixin")]),
+                entry(1, vec![(1, ALIAS, "Editor"), (2, PRIMARY_NAME, "Editor")]),
+                entry(2, vec![(3, PRIMARY_NAME, "Editor")]),
             ],
             Config::default(),
         );
+        let results = searcher.search("editor", 10, |_| 0);
 
-        assert_eq!(result_ids(&searcher, "weixni", 5), [1]);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.entry, result.field))
+                .collect::<Vec<_>>(),
+            [(1, 2), (2, 3)]
+        );
     }
 
     #[test]
-    fn default_search_only_limits_results_at_the_callers_request() {
+    fn search_only_limits_results_at_the_callers_request() {
         let searcher = Searcher::new(
             (1..=600).map(|id| entry(u64::from(id), vec![(id, PRIMARY_NAME, "xapp")])),
             Config::default(),
         );
 
-        for query in ["xapp", "app"] {
-            for limit in [0, 1, 20, 600, 1_000] {
-                assert_eq!(
-                    searcher.search(query, limit, |_, _| Ordering::Equal).len(),
-                    limit.min(600)
-                );
-            }
+        for limit in [0, 20, usize::MAX] {
+            assert_eq!(searcher.search("app", limit, |_| 0).len(), limit.min(600));
         }
-        assert!(
-            searcher
-                .search(" /-_ ", 10, |_, _| Ordering::Equal)
-                .is_empty()
-        );
+
+        assert!(searcher.search(" /-_ ", 10, |_| 0).is_empty());
     }
 
     #[test]
-    fn zero_edits_disables_direct_fuzzy_and_dictionary_correction() {
-        for role in [PRIMARY_NAME, IDENTIFIER] {
-            let searcher = Searcher::new(
-                [entry(1, vec![(1, role, "weixin")])],
-                Config {
-                    max_edits: 0,
-                    ..Config::default()
-                },
-            );
+    fn ranking_keeps_all_frizbee_matches() {
+        let names = [
+            "gtk",
+            "dingtalk",
+            "gnometweaks",
+            "toolkit",
+            "zed",
+            "gnometexteditor",
+            "firefox",
+            "fire",
+        ];
+        let searcher = Searcher::new(entries(&names), Config::default());
+        let config = MatcherConfig {
+            max_typos: Some(1),
+            casing: CaseMatching::Ignore,
+            ..MatcherConfig::default()
+        };
 
-            assert!(
-                searcher
-                    .search("weixni", 5, |_, _| Ordering::Equal)
-                    .is_empty()
-            );
-            assert_eq!(result_ids(&searcher, "weixin", 5), [1]);
+        for query in ["gtk", "zd", "fier"] {
+            let mut expected: Vec<_> = Matcher::new(query, &config)
+                .match_list(&names)
+                .into_iter()
+                .map(|hit| u64::from(hit.index) + 1)
+                .collect();
+            let mut actual = result_ids(&searcher, query, names.len());
+            expected.sort_unstable();
+            actual.sort_unstable();
+
+            assert_eq!(actual, expected, "query={query}");
         }
+    }
+
+    #[test]
+    fn long_queries_and_fields_remain_searchable() {
+        let query = "abcd".repeat(129);
+        let text = format!("{} {query}", "x".repeat(4_096));
+        let searcher = Searcher::new(entries(&[&text]), Config::default());
+
+        for query in [query.as_str(), "abcd"] {
+            assert_eq!(result_ids(&searcher, query, 1), [1]);
+        }
+    }
+
+    #[test]
+    fn zero_typos_keeps_subsequences_and_identifier_tokens() {
+        let searcher = Searcher::new(
+            [
+                entry(1, vec![(1, PRIMARY_NAME, "Zed")]),
+                entry(2, vec![(2, IDENTIFIER, "org.gnome.Nautilus")]),
+            ],
+            Config { max_typos: 0 },
+        );
+
+        assert_eq!(result_ids(&searcher, "zd", 5), [1]);
+        assert_eq!(result_ids(&searcher, "nautilus", 5), [2]);
+        assert!(result_ids(&searcher, "zedd", 5).is_empty());
+    }
+
+    #[test]
+    fn preferences_reorder_close_matches_but_not_exact_names_or_aliases() {
+        let searcher = Searcher::new(
+            [
+                entry(1, vec![(1, PRIMARY_NAME, "Calendar")]),
+                entry(2, vec![(2, PRIMARY_NAME, "Calculator")]),
+                entry(3, vec![(3, PRIMARY_NAME, "Calibre")]),
+                entry(4, vec![(4, ALIAS, "Cal")]),
+            ],
+            Config::default(),
+        );
+        let mut scored = Vec::new();
+        let results = searcher.search("cal", 4, |id| {
+            scored.push(id);
+
+            if id == 3 { 255 } else { 0 }
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.entry)
+                .collect::<Vec<_>>(),
+            [4, 3, 1, 2]
+        );
+        scored.sort_unstable();
+
+        assert_eq!(scored, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn spaced_queries_match_all_words_in_any_order() {
+        let searcher = Searcher::new(
+            entries(&["VisualStudioCode", "VisualStudio", "VideoConverter"]),
+            Config::default(),
+        );
+
+        for query in ["studio code", "code studio", "stduio cdoe", "vs code"] {
+            assert_eq!(result_ids(&searcher, query, 1), [1], "query={query}");
+        }
+
+        assert!(result_ids(&searcher, "studio zzz", 3).is_empty());
+    }
+
+    #[test]
+    fn short_misspelled_names_outrank_fragments_in_long_names() {
+        let searcher = Searcher::new(
+            entries(&[
+                "fingerprint",
+                "file folder",
+                "fire",
+                "Wireshark",
+                "LibreOffice Writer",
+                "Fire Engine",
+                "Fire Extinguisher",
+                "Crossed Fingers",
+            ]),
+            Config::default(),
+        );
+
+        assert_eq!(result_ids(&searcher, "fier", 1), [3]);
+        assert_eq!(result_ids(&searcher, "wirter", 1), [5]);
     }
 }

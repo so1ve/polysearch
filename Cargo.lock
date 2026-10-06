@@ -12,24 +12,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrayvec"
-version = "0.7.8"
+name = "frizbee"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+checksum = "19435f276a44d90570cb403d22fbe4b20c80eabc134f718d6ec0ae888eb47edc"
 dependencies = [
- "foldhash",
+ "serde",
 ]
 
 [[package]]
@@ -51,11 +39,10 @@ dependencies = [
 name = "polysearch"
 version = "0.3.2"
 dependencies = [
- "arrayvec",
+ "frizbee",
  "pinyin_pro",
  "rapidhash",
  "smallvec",
- "string-interner",
 ]
 
 [[package]]
@@ -127,6 +114,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -154,16 +142,6 @@ name = "smallvec"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
-
-[[package]]
-name = "string-interner"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad3df9b59e2eded8d825c7c4363ad339a20fb6bc0b9a4778560f518f59910b15"
-dependencies = [
- "hashbrown",
- "serde",
-]
 
 [[package]]
 name = "syn"
