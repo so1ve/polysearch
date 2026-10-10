@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/so1ve/polysearch/compare/v0.4.0...v0.4.1) - 2026-10-10
+
+### Other
+
+- *(deps)* update rust crate smallvec to v1.16.3 ([#9](https://github.com/so1ve/polysearch/pull/9))
+
 ## [0.4.0](https://github.com/so1ve/polysearch/compare/v0.3.2...v0.4.0) - 2026-10-06
 
 ### Added
